@@ -19,9 +19,31 @@ from app.routers import event_history
 settings = get_settings()
 
 # ── Logging ──────────────────────────────────────────────────────────────
+def _get_log_level(level_str: str) -> int:
+    """Map Java-style and Python log level strings to Python logging constants."""
+    level_map = {
+        "FINEST": logging.DEBUG,
+        "FINER": logging.DEBUG,
+        "FINE": logging.DEBUG,
+        "DEBUG": logging.DEBUG,
+        "INFO": logging.INFO,
+        "WARNING": logging.WARNING,
+        "WARN": logging.WARNING,
+        "SEVERE": logging.ERROR,
+        "ERROR": logging.ERROR,
+        "CRITICAL": logging.CRITICAL,
+        "FATAL": logging.CRITICAL
+    }
+    return level_map.get(level_str.upper(), logging.INFO)
+
+log_level = _get_log_level(settings.LOG_LEVEL)
 logging.basicConfig(
-    level=getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO),
+    level=log_level,
     format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler("/tmp/fyntrac-py-model.log")
+    ]
 )
 logger = logging.getLogger(__name__)
 

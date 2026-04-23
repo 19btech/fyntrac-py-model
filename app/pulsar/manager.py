@@ -1,14 +1,20 @@
 import logging
 import json
 import asyncio
+import os
+import threading
+import time
+from datetime import datetime, timezone
 from typing import Optional
 
 import pulsar
 from pulsar import Timeout
 from pymemcache.client.base import Client as MemcacheClient
+from bson.decimal128 import Decimal128
 
 from app.config import Settings
 from app.db.mongodb import mongo_manager
+from app.pulsar.producers import AggregationMessageProducer, GeneralLedgerMessageProducer
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +29,8 @@ class PulsarManager:
         self._python_model_consumer_task: Optional[asyncio.Task] = None
         self._stop_event = asyncio.Event()
         self._memcache_client: Optional[MemcacheClient] = None
+        self._aggregation_producer: Optional[AggregationMessageProducer] = None
+        self._gl_producer: Optional[GeneralLedgerMessageProducer] = None
 
     def start(self, settings: Settings) -> None:
         """Initialise Pulsar client and start consumer loop."""
@@ -42,6 +50,15 @@ class PulsarManager:
                 (settings.MEMCACHED_HOST, settings.MEMCACHED_PORT),
                 connect_timeout=5,
                 timeout=5
+            )
+
+            # Instantiate downstream producers (mirror Java AggregationMessageProducer
+            # and GeneralLedgerMessageProducer)
+            self._aggregation_producer = AggregationMessageProducer(
+                self._client, settings.PULSAR_AGGREGATION_TOPIC
+            )
+            self._gl_producer = GeneralLedgerMessageProducer(
+                self._client, settings.PULSAR_GL_STAGING_TOPIC
             )
 
             # Start the background tasks within the current asyncio event loop
@@ -71,6 +88,12 @@ class PulsarManager:
         if self._client:
             self._client.close()
             logger.info("Pulsar connection closed.")
+
+        # Close downstream producers
+        if self._aggregation_producer:
+            self._aggregation_producer.close()
+        if self._gl_producer:
+            self._gl_producer.close()
             
         if self._memcache_client:
             self._memcache_client.close()
@@ -276,16 +299,29 @@ class PulsarManager:
                 continue
 
             try:
-                payload = json.loads(msg.data().decode('utf-8'))
-                logger.info("Received Python model execution message: tenantId=%s, executionDate=%s, key=%s",
-                            payload.get("tenantId"), payload.get("executionDate"), payload.get("key"))
+                raw = msg.data()
+                # Spring Pulsar JSON schema prefixes messages with a 10-byte header:
+                # [0x0e, 0x01, <8 bytes schema version>]
+                # Strip it so we can parse plain JSON.
+                if len(raw) > 0 and raw[0] == 0x0e:
+                    raw = raw[10:]
+                elif len(raw) > 1 and raw[0] == 0x00:
+                    # Older Pulsar schema wire format: 0x00 + 4-byte schema version
+                    raw = raw[5:]
+
+                payload = json.loads(raw.decode('utf-8'))
+                logger.info(
+                    "Received Python model execution message: tenantId=%s, executionDate=%s, key=%s, isLast=%s",
+                    payload.get("tenantId"), payload.get("executionDate"),
+                    payload.get("key"), payload.get("isLast"),
+                )
 
                 await self._process_python_model_execution(payload)
 
                 consumer.acknowledge(msg)
             except json.JSONDecodeError as e:
-                logger.error("Failed to decode Python model message JSON: %s", e)
-                consumer.acknowledge(msg)
+                logger.error("Failed to decode Python model message JSON: %s | raw_hex=%s", e, msg.data()[:20].hex())
+                consumer.acknowledge(msg)  # Ack bad messages so they don’t block the queue
             except Exception as e:
                 logger.error("Error processing Python model message: %s", e, exc_info=True)
                 consumer.negative_acknowledge(msg)
@@ -293,34 +329,29 @@ class PulsarManager:
         consumer.close()
 
     async def _process_python_model_execution(self, payload: dict):
-        """Handle an incoming Python model execution message.
-        
-        Reads instrument IDs from Memcached (via the cache key in the message),
-        then executes the Python model logic for those instruments.
+        """Handle a PythonModelExecutionMessageRecord from Java dataloader.
+
+        Java record fields (Records.PythonModelExecutionMessageRecord):
+            tenantId      : String
+            executionDate : Integer  (YYYYMMDD)
+            instrumentIds : List<String>  — sent directly in the Pulsar payload
+            isLast        : boolean
         """
-        tenant_id = payload.get("tenantId")
+        tenant_id      = payload.get("tenantId")
         execution_date = payload.get("executionDate")
-        cache_key = payload.get("key")
-        is_last = payload.get("isLast", False)
+        instrument_ids = payload.get("instrumentIds", [])
+        is_last        = payload.get("isLast", False)
 
-        if not tenant_id or not cache_key:
-            logger.warning("Invalid Python model payload: missing tenantId or key. Payload: %s", payload)
+        if not tenant_id or not instrument_ids:
+            logger.warning(
+                "Invalid Python model payload: missing tenantId or instrumentIds. Payload: %s", payload
+            )
             return
 
-        # Read instrument IDs from Memcached
-        instrument_ids = []
-        try:
-            loop = asyncio.get_running_loop()
-            cached_data = await loop.run_in_executor(None, self._memcache_client.get, cache_key)
-            if cached_data:
-                instrument_ids = json.loads(cached_data.decode('utf-8'))
-                logger.info("Retrieved %d instrument IDs from Memcached key: %s", len(instrument_ids), cache_key)
-            else:
-                logger.warning("No data found in Memcached for key: %s", cache_key)
-                return
-        except Exception as e:
-            logger.error("Failed to read from Memcached key %s: %s", cache_key, e)
-            return
+        logger.info(
+            "Python model: tenant=%s executionDate=%s instruments=%d isLast=%s",
+            tenant_id, execution_date, len(instrument_ids), is_last,
+        )
 
         # Fetch tenant database
         try:
@@ -329,181 +360,723 @@ class PulsarManager:
             logger.error("Failed to get DB for tenant %s: %s", tenant_id, e)
             return
 
-        # Execute Python model for each instrument
-        await self._execute_python_model(db, tenant_id, execution_date, instrument_ids)
+        numeric_job_id = int(time.time() * 1000)
+        await self._execute_python_model(db, tenant_id, execution_date, instrument_ids, numeric_job_id)
 
         if is_last:
-            logger.info("Last batch processed for Python model execution. Tenant=%s, Date=%s",
-                        tenant_id, execution_date)
+            logger.info(
+                "Last chunk processed. Tenant=%s, JobId=%s, Date=%s",
+                tenant_id, numeric_job_id, execution_date,
+            )
 
-    async def _execute_python_model(self, db, tenant_id: str, execution_date: int, instrument_ids: list):
+    async def _execute_python_model(self, db, tenant_id: str, execution_date: int, instrument_ids: list, job_id: int):
         """Execute the Python model logic for a batch of instruments in parallel.
 
-        Each instrument is processed in a separate thread using a ThreadPoolExecutor 
-        to achieve true parallelism for CPU-bound model execution tasks.
+        After all instruments are processed (mirroring Java ModelExecutionService.executeExcelModels
+        finally block), publishes:
+          1. ExecuteAggregationMessageRecord → fyntrac-aggregate-execution
+          2. GeneralLedgerMessageRecord      → fyntrac-book-gl-staging
         """
         collection = db["EventHistory"]
-        max_concurrency = min(32, (os.cpu_count() or 1) * 4)  # Reasonable thread pool size
+        max_concurrency = min(32, (os.cpu_count() or 1) * 4)
         
         logger.info("Executing Python model for %d instruments in parallel (threads=%d) "
                      "tenant=%s postingDate=%s",
                      len(instrument_ids), max_concurrency, tenant_id, execution_date)
 
-        # We need a synchronous function to run in the thread pool that handles the async event loop
-        # But wait, collection.find() is async (Motor). So we need to query data asynchronously FIRST,
-        # OR we isolate the CPU-bound portion to be run in executor!
-        
-        # Let's query events async first, then pass the data to threads for CPU-bound execution.
-        async def fetch_instrument_data(instrument_id: str):
-            try:
-                query = {"instrumentId": instrument_id}
-                if execution_date is not None:
-                    query["postingDate"] = execution_date
+        # 1. Fetch active Models → resolve ModelFile → extract Python code
+        #    Mirrors Java: modelDataService.getActiveModels(tenantId)
+        #                  modelDataService.getModelFile(model.getModelFileId(), tenantId)
+        python_code = ""
+        exec_globals = None
+        try:
+            python_code, exec_globals = await self._load_active_model(db, tenant_id)
+            if not python_code or exec_globals is None:
+                return   # error already logged inside helper
+        except Exception as e:
+            logger.error("Unexpected error loading model for tenant %s: %s", tenant_id, e)
+            return
 
-                events = []
+        # 2. Fetch all events for the entire chunk in a single query
+        logger.info("Fetching data for %d instruments from MongoDB...", len(instrument_ids))
+        query = {"instrumentId": {"$in": instrument_ids}}
+        if execution_date is not None:
+            query["postingDate"] = execution_date
+
+        all_events = []
+        loop = asyncio.get_running_loop()
+
+        # ── All processing wrapped in try/finally so downstream publishers
+        # always fire, mirroring Java's ModelExecutionService.executeExcelModels finally block.
+        try:
+            try:
                 async for doc in collection.find(query).sort("priority", -1):
                     if "_id" in doc:
                         doc["_id"] = str(doc["_id"])
-                    events.append(doc)
-                return instrument_id, events
+                    all_events.append(doc)
             except Exception as e:
-                logger.error("Error fetching data for %s: %s", instrument_id, e)
-                return instrument_id, None
+                logger.error("Error fetching data for chunk: %s", e)
+                return
 
-        logger.info("Fetching data for %d instruments from MongoDB...", len(instrument_ids))
-        
-        # Fetch all instrument data concurrently (I/O bound)
-        fetch_tasks = [fetch_instrument_data(iid) for iid in instrument_ids]
-        fetched_results = await asyncio.gather(*fetch_tasks, return_exceptions=True)
-        
-        loop = asyncio.get_running_loop()
-        success_count = 0
-        
-        import concurrent.futures
-        
-        # Now run the CPU-bound processing in a ThreadPoolExecutor
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_concurrency) as pool:
-            process_futures = []
+            if not all_events:
+                logger.info("No events found for the given instruments in tenant %s", tenant_id)
+                return
+
+            # Prepare date string
+            date_str = str(execution_date)
+            posting_date_str = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]}"
+
+            # 3. Transform the data ONCE for the whole chunk
+            from app.python_model.data_transformer import transform
+            try:
+                event_data_list, raw_event_data = await loop.run_in_executor(
+                    None, 
+                    transform, 
+                    all_events, 
+                    posting_date_str
+                )
+            except Exception as e:
+                logger.error("Failed to transform data for chunk: %s", e)
+                return
+
+            # Map event_data and raw event docs by instrumentid for O(1) lookup
+            instrument_data_map = {}
+            instrument_event_map = {}   # first EventHistory doc per instrument for metadata
+            for row in event_data_list:
+                iid = row.get("instrumentid")
+                if iid:
+                    instrument_data_map[iid] = row
+            for doc in all_events:
+                iid = doc.get("instrumentId")
+                if iid and iid not in instrument_event_map:
+                    instrument_event_map[iid] = doc
             
-            for result in fetched_results:
-                if isinstance(result, Exception) or result is None:
-                    continue
-                
-                instrument_id, events = result
-                if not events:
-                    continue
-                    
-                # Submit synchronous CPU-bound task to thread pool
-                future = loop.run_in_executor(
-                    pool,
-                    self._process_instrument_sync,
+            # 4. Fetch Attributes definitions once for the batch, then resolve
+            #    the active InstrumentAttribute values per instrument.
+            #    Done here (async, before the thread pool) to keep DB calls off threads.
+            attr_definitions = await self._fetch_attribute_definitions(db)
+            instrument_attributes_map: dict = {}
+            if attr_definitions:
+                for _iid in instrument_ids:
+                    attr_dict, version_id = await self._fetch_instrument_attributes(
+                        db, _iid, attr_definitions
+                    )
+                    instrument_attributes_map[_iid] = {
+                        "attributes": attr_dict,
+                        "versionId": version_id
+                    }
+                    logger.info(
+                        "Resolved %d attributes for instrument %s (versionId=%s)",
+                        len(attr_dict), _iid, version_id
+                    )
+            else:
+                logger.warning(
+                    "No attribute definitions found in Attributes collection for tenant %s; "
+                    "TransactionActivity.attributes will be empty.",
                     tenant_id,
-                    instrument_id,
-                    execution_date,
-                    events
                 )
-                process_futures.append(future)
+
+            # 5. Run the CPU-bound model execution in a ThreadPoolExecutor
+            success_count = 0
+            import concurrent.futures
             
-            if process_futures:
-                # Wait for all threads to complete
-                results = await asyncio.gather(*process_futures, return_exceptions=True)
-                for r in results:
-                    if isinstance(r, Exception):
-                        logger.error("Thread pool execution error: %s", r)
-                    elif r:
-                        success_count += 1
-                        
-        logger.info(
-            "Python model: completed batch. Instruments=%d, Succeeded=%d, Failed=%d, "
-            "Tenant=%s, PostingDate=%s",
-            len(instrument_ids), success_count, len(instrument_ids) - success_count,
-            tenant_id, execution_date
-        )
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_concurrency) as pool:
+                process_futures = []
+                
+                for instrument_id in instrument_ids:
+                    instr_data = instrument_data_map.get(instrument_id)
+                    if not instr_data:
+                        # No data for this instrument
+                        continue
 
-    def _process_instrument_sync(self, tenant_id: str, instrument_id: str, posting_date: int, events: list) -> bool:
-        """Synchronous method executed in a separate thread for CPU-bound processing."""
-        try:
-            logger.info("Instrument %s: processing %d events (thread=%s)", 
-                        instrument_id, len(events), threading.current_thread().name)
-            
-            # Group events by attributeId
-            events_by_attribute = {}
-            for event in events:
-                attribute_id = self._extract_attribute_id(event)
-                if attribute_id not in events_by_attribute:
-                    events_by_attribute[attribute_id] = []
-                events_by_attribute[attribute_id].append(event)
+                    # Enrich instr_data with active InstrumentAttribute values
+                    ia_dict = instrument_attributes_map.get(instrument_id, {}).get("attributes", {})
+                    for k, v in ia_dict.items():
+                        attr_key = f"ATTRIBUTE_{k}"
+                        if attr_key not in instr_data:
+                            instr_data[attr_key] = v
+                        if k not in instr_data:
+                            instr_data[k] = v
+                            
+                    future = loop.run_in_executor(
+                        pool,
+                        self._process_instrument_pretransformed,
+                        tenant_id,
+                        instrument_id,
+                        posting_date_str,
+                        instr_data,
+                        raw_event_data,
+                        exec_globals,
+                        python_code,
+                        instrument_event_map.get(instrument_id, {}),
+                    )
+                    process_futures.append(future)
+                
+                acct_periods_cache = {}
 
-            # Process each group
-            for attribute_id, attribute_events in events_by_attribute.items():
-                self._process_instrument_attribute_sync(
-                    tenant_id, instrument_id, attribute_id, posting_date, attribute_events
-                )
-            
-            return True
-        except Exception as e:
-            logger.error("Error in thread processing instrument %s: %s", instrument_id, e, exc_info=True)
-            return False
+                if process_futures:
+                    results = await asyncio.gather(*process_futures, return_exceptions=True)
+                    
+                    for r in results:
+                        if isinstance(r, Exception):
+                            logger.error("Thread pool execution error: %s", r)
+                        else:
+                            instrument_id, success, transactions, event_doc = r
+                            new_status = "COMPLETED" if success else "ERROR_OUT"
 
-    def _extract_attribute_id(self, event: dict) -> str:
-        """Extract attributeId from an EventHistory document.
+                            if success:
+                                success_count += 1
 
-        The attributeId may be:
-        1. A top-level field on the document
-        2. Nested inside eventDetail.values as a key or value
-        Falls back to 'default' if not found.
-        """
-        # Check top-level field first
-        attr_id = event.get("attributeId")
-        if attr_id:
-            return str(attr_id)
+                            # Update the EventHistory status in MongoDB
+                            try:
+                                update_query = {"instrumentId": instrument_id}
+                                if execution_date is not None:
+                                    update_query["postingDate"] = execution_date
 
-        # Check inside eventDetail.values
-        event_detail = event.get("eventDetail")
-        if event_detail and isinstance(event_detail, dict):
-            values = event_detail.get("values")
-            if values and isinstance(values, dict):
-                # values is Map<String, Map<String, Object>>
-                # Look for attributeId in the inner maps
-                for source_key, value_map in values.items():
-                    if isinstance(value_map, dict):
-                        aid = value_map.get("attributeId")
-                        if aid:
-                            return str(aid)
+                                await collection.update_many(
+                                    update_query,
+                                    {"$set": {"status": new_status}}
+                                )
+                            except Exception as db_err:
+                                logger.error("Failed to update status to %s for instrument %s: %s",
+                                             new_status, instrument_id, db_err)
 
-        return "default"
+                            # Save TransactionActivity documents to MongoDB
+                            if transactions:
+                                try:
+                                    docs = []
+                                    for t in transactions:
+                                        # Check zero-amount transactions
+                                        is_zero = False
+                                        try:
+                                            if float(t.get("amount", 0)) == 0:
+                                                is_zero = True
+                                        except (TypeError, ValueError):
+                                            pass
+                                            
+                                        ia_data = instrument_attributes_map.get(instrument_id, {})
+                                        version_id = ia_data.get("versionId", 0)
+                                        
+                                        doc = self._build_transaction_activity(
+                                            t, tenant_id, instrument_id, job_id, version_id
+                                        )
+                                        
+                                        # Log and discard zero-amount transactions
+                                        if is_zero:
+                                            logger.info("Discarding zero-amount TransactionActivity for %s: %s", instrument_id, doc)
+                                            continue
+                                            
+                                        # Enrich with context
+                                        period_id = doc.get("originalPeriodId", 0)
+                                        if period_id not in acct_periods_cache:
+                                            try:
+                                                acct_periods_cache[period_id] = await db["AccountingPeriod"].find_one({"periodId": period_id})
+                                            except Exception as e:
+                                                logger.error("Failed to fetch accounting period for periodId %s: %s", period_id, e)
+                                                acct_periods_cache[period_id] = None
+                                                
+                                        doc["accountingPeriod"] = acct_periods_cache.get(period_id)
+                                        if event_doc:
+                                            doc["sourceId"]         = str(event_doc.get("_id", ""))
+                                        # Populate attributes from Attributes + InstrumentAttribute
+                                        doc["attributes"] = ia_data.get("attributes", {})
+                                        docs.append(doc)
 
-    def _process_instrument_attribute_sync(self, tenant_id: str, instrument_id: str,
-                                             attribute_id: str, posting_date: int,
-                                             events: list):
-        """Synchronous version of attribute processing (executed in thread)."""
-        logger.info(
-            "Thread processing: tenant=%s, instrument=%s, attribute=%s, postingDate=%s, events=%d",
-            tenant_id, instrument_id, attribute_id, posting_date, len(events)
-        )
+                                    if docs:
+                                        for d in docs:
+                                            logger.info("Generated TransactionActivity doc: %s", d)
+                                            
+                                        await db["TransactionActivity"].insert_many(docs)
+                                        logger.info(
+                                            "Saved %d TransactionActivity docs for instrument %s",
+                                            len(docs), instrument_id,
+                                        )
+                                    else:
+                                        logger.info(
+                                            "No non-zero TransactionActivity docs to save for instrument %s",
+                                            instrument_id,
+                                        )
+                                except Exception as tx_err:
+                                    logger.error(
+                                        "Failed to save TransactionActivity for instrument %s: %s",
+                                        instrument_id, tx_err,
+                                    )
 
-        for event in events:
-            event_name = event.get("eventName", "unknown")
-            event_id = event.get("eventId", "")
-            effective_date = event.get("effectiveDate")
-            priority = event.get("priority", 0)
-
-            event_values = {}
-            event_detail = event.get("eventDetail")
-            if event_detail and isinstance(event_detail, dict):
-                values = event_detail.get("values")
-                if values and isinstance(values, dict):
-                    for source_key, field_map in values.items():
-                        if isinstance(field_map, dict):
-                            event_values.update(field_map)
-
-            logger.debug(
-                "  Event: name=%s, id=%s, effectiveDate=%s, priority=%d",
-                event_name, event_id, effective_date, priority
+                            
+            logger.info(
+                "Python model: completed batch. Instruments=%d, Succeeded=%d, Failed=%d, "
+                "Tenant=%s, PostingDate=%s JobId=%s",
+                len(instrument_ids), success_count, len(process_futures) - success_count,
+                tenant_id, execution_date, job_id
             )
 
-            # TODO: CPU-BOUND Python model logic goes here
+        finally:
+            # ── Mirror Java ModelExecutionService finally block ───────────────
+            # Publish aggregation trigger → consumed by Java AggregationService
+            # Publish GL booking trigger  → consumed by Java GL service
+            # Both happen regardless of success, partial failure, or empty event set.
+            try:
+                await self._aggregation_producer.execute_aggregation(
+                    tenant_id=tenant_id,
+                    job_id=job_id,
+                    aggregation_date=execution_date,  # YYYYMMDD int, same as postingDate
+                    loop=loop,
+                )
+            except Exception as agg_err:
+                logger.error("Failed to publish aggregation message for jobId=%s: %s", job_id, agg_err)
+
+            try:
+                await self._gl_producer.book_temp_gl(
+                    tenant_id=tenant_id,
+                    job_id=job_id,
+                    loop=loop,
+                )
+            except Exception as gl_err:
+                logger.error("Failed to publish GL staging message for jobId=%s: %s", job_id, gl_err)
+
+    def _deserialize_cache_list(self, raw: bytes, cache_key: str):
+        """Deserialize a Memcached value written by Java's memcachedRepository.
+
+        Java stores objects using Java object serialization (magic 0xac 0xed).
+        CacheList<String> deserializes to an object whose 'list' field holds the IDs.
+
+        Falls back to JSON for plain-text / test payloads.
+
+        Returns:
+            list[str] on success, or None on failure (error already logged).
+        """
+        JAVA_MAGIC = b'\xac\xed'
+
+        if isinstance(raw, str):
+            raw = raw.encode('utf-8')
+
+        # ── Strategy 1: Java binary serialization ─────────────────────────
+        if raw[:2] == JAVA_MAGIC:
+            try:
+                import javaobj
+                obj = javaobj.loads(raw)
+                # CacheList extends ArrayList / has a 'list' field or is itself iterable
+                ids = self._extract_ids_from_java_obj(obj)
+                if ids is not None:
+                    logger.info(
+                        "Deserialized Java CacheList from Memcached key %s: %d IDs",
+                        cache_key, len(ids),
+                    )
+                    return ids
+                logger.error(
+                    "Could not extract ID list from Java object for key %s. "
+                    "obj type=%s repr=%s", cache_key, type(obj), repr(obj)[:200]
+                )
+                return None
+            except Exception as e:
+                logger.error(
+                    "javaobj deserialization failed for key %s: %s", cache_key, e
+                )
+                return None
+
+        # ── Strategy 2: JSON fallback (plain-text / test payloads) ────────
+        try:
+            decoded = json.loads(raw.decode('utf-8'))
+            if isinstance(decoded, list):
+                return decoded
+            if isinstance(decoded, dict) and "list" in decoded:
+                return decoded["list"]
+            logger.error(
+                "Unexpected JSON structure in Memcached key %s: %s", cache_key, type(decoded)
+            )
+            return None
+        except Exception as e:
+            logger.error(
+                "Failed to decode Memcached value for key %s "
+                "(not Java serial, not JSON). First 20 bytes: %s — %s",
+                cache_key, raw[:20].hex(), e,
+            )
+            return None
+
+    @staticmethod
+    def _extract_ids_from_java_obj(obj) -> list:
+        """Recursively walk a javaobj-deserialized object to extract string IDs.
+
+        CacheList<String> is serialized with its ArrayList superclass data,
+        so the strings are in obj.annotations or accessible via iteration.
+        """
+        import javaobj
+
+        # javaobj v0.4+ returns JavaObject; try common patterns
+        ids = []
+
+        # Pattern A: object has a 'list' field (Jackson-style)
+        if hasattr(obj, 'list') and obj.list is not None:
+            for item in obj.list:
+                ids.append(str(item))
+            return ids
+
+        # Pattern B: JavaObject whose classdesc is ArrayList or CacheList
+        # — string children are in obj.annotations (class data annotations)
+        if hasattr(obj, 'annotations') and obj.annotations:
+            for item in obj.annotations:
+                if isinstance(item, str):
+                    ids.append(item)
+                elif hasattr(item, '__class__') and hasattr(item, 'annotations'):
+                    # nested JavaObject (String wrapper)
+                    pass
+            if ids:
+                return ids
+
+        # Pattern C: JavaList (javaobj wraps ArrayList-like as a Python list)
+        if isinstance(obj, (list, tuple)):
+            return [str(i) for i in obj]
+
+        # Pattern D: iterate via __iter__
+        try:
+            for item in obj:
+                if isinstance(item, str):
+                    ids.append(item)
+                else:
+                    ids.append(str(item))
+            if ids:
+                return ids
+        except TypeError:
             pass
+
+        return None
+
+    async def _load_active_model(self, db, tenant_id: str) -> tuple:
+        """Fetch the first active Python model from MongoDB and compile it.
+
+        Two-step lookup mirroring Java ModelExecutionService:
+          1. Query ``Models`` collection for active, non-deleted records.
+          2. Use ``modelFileId`` to fetch the file from ``ModelFiles``.
+          3. Decode the BSON Binary ``fileData``:
+               - ModelType.PYTHON  → raw bytes are the Python source code (.py file).
+               - ModelType.EXCEL   → open as openpyxl workbook, read the "dsl_code" sheet.
+
+        Returns:
+            (python_code: str, exec_globals: dict) on success.
+            (None, None) on any failure (errors are logged).
+        """
+        # ── Step 1: Find active models ────────────────────────────────────
+        # Java equivalent:
+        #   query.addCriteria(Criteria.where("isDeleted").is(0)
+        #                              .and("modelStatus").is(ModelStatus.ACTIVE))
+        try:
+            model_doc = await db["Models"].find_one(
+                {"isDeleted": 0, "modelStatus": "ACTIVE"},
+                sort=[("orderId", 1)],   # honour orderId ordering like Java
+            )
+        except Exception as e:
+            logger.error("Failed to query Models collection for tenant %s: %s", tenant_id, e)
+            return None, None
+
+        if not model_doc:
+            logger.error(
+                "No active model found in Models collection for tenant %s. "
+                "Ensure at least one model has modelStatus='ACTIVE' and isDeleted=0.",
+                tenant_id,
+            )
+            return None, None
+
+        model_file_id = model_doc.get("modelFileId")
+        model_name    = model_doc.get("modelName", "<unnamed>")
+        model_type    = model_doc.get("modelType", "PYTHON")   # "PYTHON" | "EXCEL"
+
+        logger.info(
+            "Found active model '%s' (id=%s, type=%s, modelFileId=%s) for tenant %s",
+            model_name, model_doc.get("_id"), model_type, model_file_id, tenant_id,
+        )
+
+        if not model_file_id:
+            logger.error("Model '%s' has no modelFileId. Cannot load file.", model_name)
+            return None, None
+
+        # ── Step 2: Fetch the ModelFile ───────────────────────────────────
+        # Java equivalent: modelDataService.getModelFile(model.getModelFileId(), tenantId)
+        try:
+            from bson import ObjectId
+            file_doc = await db["ModelFiles"].find_one({"_id": ObjectId(model_file_id)})
+        except Exception as e:
+            logger.error(
+                "Failed to fetch ModelFile for modelFileId=%s (model='%s'): %s",
+                model_file_id, model_name, e,
+            )
+            return None, None
+
+        if not file_doc:
+            logger.error(
+                "ModelFile not found for id=%s (model='%s').", model_file_id, model_name
+            )
+            return None, None
+
+        # ── Step 3: Decode fileData Binary ────────────────────────────────
+        # Motor/PyMongo decodes org.bson.types.Binary → bytes automatically.
+        file_data = file_doc.get("fileData")
+        if file_data is None:
+            logger.error("ModelFile %s has no fileData.", model_file_id)
+            return None, None
+
+        # Motor returns BSON Binary as bytes directly; handle both just in case.
+        raw_bytes: bytes = bytes(file_data) if not isinstance(file_data, bytes) else file_data
+
+        python_code: str = ""
+
+        if model_type.upper() == "PYTHON":
+            # The file is a raw .py file uploaded via /api/model/upload/python
+            # Java: ExcelFileUtil.convertToMongoBinary(dslTemplate) → dslTemplate.getBytes()
+            try:
+                python_code = raw_bytes.decode("utf-8")
+                logger.info(
+                    "Decoded Python source (%d bytes) from ModelFile %s.",
+                    len(raw_bytes), model_file_id,
+                )
+            except UnicodeDecodeError as e:
+                logger.error("Failed to UTF-8 decode Python model file %s: %s", model_file_id, e)
+                return None, None
+        else:
+            # EXCEL model — open workbook and read the DSL code sheet
+            # Sheet name used by ExcelFileService for the generated Python code.
+            DSL_CODE_SHEET = "dsl_code"
+            try:
+                import io
+                import openpyxl
+                workbook = openpyxl.load_workbook(io.BytesIO(raw_bytes), read_only=True, data_only=True)
+                if DSL_CODE_SHEET not in workbook.sheetnames:
+                    logger.error(
+                        "Excel model '%s' has no '%s' sheet. Available sheets: %s",
+                        model_name, DSL_CODE_SHEET, workbook.sheetnames,
+                    )
+                    return None, None
+                sheet = workbook[DSL_CODE_SHEET]
+                # Code is stored one line per row in column A
+                lines = []
+                for row in sheet.iter_rows(values_only=True):
+                    cell_val = row[0] if row else None
+                    lines.append(str(cell_val) if cell_val is not None else "")
+                python_code = "\n".join(lines)
+                logger.info(
+                    "Extracted DSL code (%d lines) from sheet '%s' of model '%s'.",
+                    len(lines), DSL_CODE_SHEET, model_name,
+                )
+            except Exception as e:
+                logger.error(
+                    "Failed to read Excel model '%s' (ModelFile %s): %s",
+                    model_name, model_file_id, e,
+                )
+                return None, None
+
+        if not python_code.strip():
+            logger.error("Extracted Python code is empty for model '%s'.", model_name)
+            return None, None
+
+        # ── Step 4: Compile the template ─────────────────────────────────
+        try:
+            from app.python_model.model_runner import ModelRunner
+            runner = ModelRunner()
+            exec_globals = runner.compile_template(python_code)
+            logger.info("Successfully compiled model '%s' for tenant %s.", model_name, tenant_id)
+            return python_code, exec_globals
+        except Exception as e:
+            logger.error("Failed to compile model '%s': %s", model_name, e)
+            return None, None
+
+    def _process_instrument_pretransformed(
+        self,
+        tenant_id: str,
+        instrument_id: str,
+        posting_date_str: str,
+        instr_data: dict,
+        raw_event_data: dict,
+        exec_globals: dict,
+        python_code: str,
+        event_doc: dict = None,
+    ) -> tuple:
+        """Synchronous method executed in a separate thread. Runs the model on pre-transformed data."""
+        try:
+            logger.debug("Instrument %s: processing pre-transformed data (thread=%s)",
+                        instrument_id, threading.current_thread().name)
+
+            from app.python_model.model_runner import ModelRunner
+            runner = ModelRunner()
+
+            result = runner.run(
+                python_code=python_code,
+                event_data=[instr_data],
+                raw_event_data=raw_event_data,
+                override_postingdate=posting_date_str,
+                exec_globals=exec_globals
+            )
+
+            if result.get("error"):
+                logger.error("Model execution failed for instrument %s: %s", instrument_id, result["error"])
+                return (instrument_id, False, [], event_doc or {})
+
+            transactions = result.get("transactions", [])
+            logger.info("Model executed for %s: generated %d transactions", instrument_id, len(transactions))
+
+            return (instrument_id, True, transactions, event_doc or {})
+        except Exception as e:
+            logger.error("Error in thread processing instrument %s: %s", instrument_id, e, exc_info=True)
+            return (instrument_id, False, [], event_doc or {})
+
+    # ------------------------------------------------------------------
+    # Attribute helpers
+    # ------------------------------------------------------------------
+    async def _fetch_attribute_definitions(self, db) -> list:
+        """Fetch all Attribute definition documents from the Attributes collection.
+
+        Actual Attributes schema (from MongoDB):
+            {
+              _id           : ObjectId,
+              attributeName : str,       # e.g. 'MERCHANT_INDUSTRY'
+              isReclassable : 0|1,
+              isVersionable : 0|1,
+              dataType      : str,
+              userField     : str,
+              ...
+            }
+        """
+        try:
+            definitions = []
+            async for doc in db["Attributes"].find({}):
+                definitions.append(doc)
+            logger.info(
+                "Loaded %d attribute definitions from Attributes collection.",
+                len(definitions),
+            )
+            if not definitions:
+                logger.warning(
+                    "Attributes collection is empty — no attribute definitions to process."
+                )
+            return definitions
+        except Exception as e:
+            logger.warning("Failed to fetch Attributes definitions: %s", e)
+            return []
+
+    async def _fetch_instrument_attributes(self, db, instrument_id: str, attr_definitions: list) -> tuple[dict, int]:
+        """Resolve active attribute values for a single instrument.
+
+        Schema (confirmed from MongoDB)
+        --------------------------------
+        Attributes collection:
+            { attributeName, isReclassable: 0|1, isVersionable: 0|1, ... }
+
+        InstrumentAttribute collection — ONE active record per instrument:
+            {
+              instrumentId : str,
+              attributeId  : '1.0',   # NOT linked to Attributes._id
+              endDate      : None,    # null = active
+              attributes   : {        # flat { attributeName: value } dict
+                'MERCHANT_INDUSTRY': 'SPORTING GOODS AND OUTDOORS',
+                'INTEREST_RATE': 8.0,
+                ...
+              }
+            }
+
+        Algorithm
+        ---------
+        1. Fetch the single active InstrumentAttribute for this instrument
+           (filter: instrumentId + endDate=null — no attributeId filter).
+        2. From qualifying attr_definitions (isReclassable=1 OR isVersionable=1),
+           pick ia_doc['attributes'][attributeName].
+        3. Return { attributeName: value } dict.
+        """
+        attr_dict: dict = {}
+
+        # ── Step 1: Fetch the single active InstrumentAttribute ───────────
+        # There is only ONE active record per instrument (endDate=null).
+        # attributeId on InstrumentAttribute ('1.0') is NOT a join key to Attributes.
+        try:
+            ia_doc = await db["InstrumentAttribute"].find_one({
+                "instrumentId": instrument_id,
+                "endDate":      None,
+            })
+        except Exception as e:
+            logger.warning(
+                "Failed to query InstrumentAttribute for instrument=%s: %s",
+                instrument_id, e,
+            )
+            return attr_dict, 0
+
+        if ia_doc is None:
+            logger.info(
+                "No active InstrumentAttribute found for instrument=%s (endDate=null)",
+                instrument_id,
+            )
+            return attr_dict, 0
+
+        ia_attributes = ia_doc.get("attributes")
+        if not isinstance(ia_attributes, dict):
+            logger.warning(
+                "InstrumentAttribute for instrument=%s has no 'attributes' sub-document "
+                "(got type=%s); skipping.",
+                instrument_id, type(ia_attributes).__name__,
+            )
+            return attr_dict, ia_doc.get("versionId", 0)
+
+        # ── Step 2: Pick values for qualifying attribute definitions ──────
+        for attr_def in attr_definitions:
+            if not bool(attr_def.get("isReclassable", 0)):
+                continue
+
+            attr_name: str = attr_def.get("attributeName") or ""
+            if not attr_name:
+                continue
+
+            if attr_name not in ia_attributes:
+                logger.info(
+                    "attributeName '%s' not in InstrumentAttribute.attributes for instrument=%s; skipping.",
+                    attr_name, instrument_id,
+                )
+                continue
+
+            attr_dict[attr_name] = ia_attributes[attr_name]
+            logger.info(
+                "Resolved attribute '%s'=%r for instrument %s",
+                attr_name, ia_attributes[attr_name], instrument_id,
+            )
+
+        return attr_dict, ia_doc.get("versionId", 0)
+
+    @staticmethod
+    def _build_transaction_activity(tx: dict, tenant_id: str, instrument_id: str, job_id: int, version_id: int = 0) -> dict:
+        """Map ModelRunner transaction output → TransactionActivity MongoDB document.
+
+        ModelRunner fields:             TransactionActivity fields:
+          transactiontype          →    transactionName
+          amount                   →    amount  (stored as string "%.4f")
+          subinstrumentid          →    attributeId
+          postingdate  (YYYY-MM-DD)→    postingDate  (YYYYMMDD int)
+          effectivedate(YYYY-MM-DD)→    effectiveDate (YYYYMMDD int)
+          instrumentid             →    instrumentId
+        """
+        def _date_to_int(val: str) -> int:
+            """Convert YYYY-MM-DD string to YYYYMMDD int."""
+            try:
+                return int(str(val).replace("-", "")[:8])
+            except Exception:
+                return 0
+
+        posting_int  = _date_to_int(tx.get("postingdate",  ""))
+        effective_int = _date_to_int(tx.get("effectivedate", ""))
+        amount_raw   = tx.get("amount", 0)
+
+        return {
+            "instrumentId":               instrument_id,
+            "transactionName":            tx.get("transactiontype", "").upper(),
+            "amount":                     Decimal128(str(float(amount_raw))),
+            "attributeId":                tx.get("subinstrumentid", "1.0"),
+            "originalPeriodId":           posting_int // 100,   # YYYYMM
+            "instrumentAttributeVersionId": version_id,
+            "accountingPeriod":           None,  # enriched below if available
+            "periodId":                   0,
+            "batchId":                    job_id,
+            "source":                     "MODEL",
+            "sourceId":                   "",
+            "postingDate":                posting_int,
+            "effectiveDate":              effective_int,
+            "attributes":                 {},
+            "isReplayable":               0,
+            "_class":                     "com.fyntrac.common.entity.TransactionActivity",
+        }
 
 
 

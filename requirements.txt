@@ -8,3 +8,7 @@ pydantic>=2.5.0
 pydantic-settings>=2.1.0
 pulsar-client>=3.4.0
 pymemcache>=4.0.0
+openpyxl>=3.1.0
+javaobj-py3>=0.4.3
+pytest>=8.0.0
+pytest-asyncio>=0.23.0

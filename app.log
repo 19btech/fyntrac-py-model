@@ -1,0 +1,81 @@
+2026-04-18 04:54:20,150 [INFO] app.main - Starting fyntrac-py-model service on port 8090
+2026-04-18 04:54:20,151 [INFO] app.db.mongodb - Connecting to MongoDB at 127.0.0.1:27017
+2026-04-18 04:54:20,153 [INFO] app.main - MongoDB client initialised
+2026-04-18 04:54:20,153 [INFO] app.pulsar.manager - Connecting to Pulsar at pulsar://localhost:6650
+2026-04-18 04:54:20,154 [INFO] app.pulsar.manager - Pulsar background consumers (EventHistory + PythonModel) and Memcached connected.
+2026-04-18 04:54:20,154 [INFO] app.pulsar.manager - Subscribing to topic: persistent://public/default/event-history-query
+2026-04-18 04:54:20,160 [INFO] app.pulsar.manager - Subscribing to Python model execution topic: persistent://public/default/fyntrac-python-model-execution
+2026-04-18 04:55:20,058 [INFO] app.pulsar.manager - Received Python model execution message: tenantId=TNT001, executionDate=20220131, jobId=job-e4c78271-d347-4ed8-a1b6-f3a77fe0e2ee
+2026-04-18 04:55:20,059 [INFO] app.pulsar.manager - Received chunk for jobId: job-e4c78271-d347-4ed8-a1b6-f3a77fe0e2ee with 1 instruments from Pulsar payload.
+2026-04-18 04:55:20,059 [INFO] app.pulsar.manager - Executing Python model for 1 instruments in parallel (threads=32) tenant=TNT001 postingDate=20220131
+2026-04-18 04:55:20,067 [INFO] app.pulsar.manager - Successfully fetched DSL template 'SBO' (v1) for tenant TNT001
+2026-04-18 04:55:20,072 [INFO] app.pulsar.manager - Successfully compiled DSL template for execution.
+2026-04-18 04:55:20,072 [INFO] app.pulsar.manager - Fetching data for 1 instruments from MongoDB...
+2026-04-18 04:55:20,075 [INFO] app.pulsar.manager - Model executed for LOAN2: generated 3 transactions
+2026-04-18 04:55:20,075 [INFO] app.pulsar.manager - Transactions for instrument LOAN2: [{'postingdate': '2022-01-31', 'effectivedate': '2022-01-31', 'instrumentid': 'LOAN2', 'subinstrumentid': '1', 'transactiontype': 'Purchase_Principal', 'amount': 150000.0, 'tenantId': 'TNT001', 'createdAt': datetime.datetime(2026, 4, 17, 23, 55, 20, 75958, tzinfo=datetime.timezone.utc)}, {'postingdate': '2022-01-31', 'effectivedate': '2022-01-31', 'instrumentid': 'LOAN2', 'subinstrumentid': '1', 'transactiontype': 'Purchase_Interest', 'amount': 200.0, 'tenantId': 'TNT001', 'createdAt': datetime.datetime(2026, 4, 17, 23, 55, 20, 75960, tzinfo=datetime.timezone.utc)}, {'postingdate': '2022-01-31', 'effectivedate': '2022-01-31', 'instrumentid': 'LOAN2', 'subinstrumentid': '1', 'transactiontype': 'Interest_Accrual', 'amount': 0.0, 'tenantId': 'TNT001', 'createdAt': datetime.datetime(2026, 4, 17, 23, 55, 20, 75961, tzinfo=datetime.timezone.utc)}]
+2026-04-18 04:55:20,076 [INFO] app.pulsar.manager - Python model: completed batch. Instruments=1, Succeeded=1, Failed=0, Tenant=TNT001, PostingDate=20220131
+2026-04-18 04:55:20,076 [INFO] app.pulsar.manager - Received Python model execution message: tenantId=TNT001, executionDate=20220131, jobId=job-e4c78271-d347-4ed8-a1b6-f3a77fe0e2ee
+2026-04-18 04:55:20,076 [INFO] app.pulsar.manager - Received chunk for jobId: job-e4c78271-d347-4ed8-a1b6-f3a77fe0e2ee with 2 instruments from Pulsar payload.
+2026-04-18 04:55:20,076 [INFO] app.pulsar.manager - Executing Python model for 2 instruments in parallel (threads=32) tenant=TNT001 postingDate=20220131
+2026-04-18 04:55:20,077 [INFO] app.pulsar.manager - Successfully fetched DSL template 'SBO' (v1) for tenant TNT001
+2026-04-18 04:55:20,079 [INFO] app.pulsar.manager - Successfully compiled DSL template for execution.
+2026-04-18 04:55:20,079 [INFO] app.pulsar.manager - Fetching data for 2 instruments from MongoDB...
+2026-04-18 04:55:20,080 [INFO] app.pulsar.manager - Model executed for LOAN3: generated 3 transactions
+2026-04-18 04:55:20,081 [INFO] app.pulsar.manager - Model executed for LOAN1: generated 3 transactions
+2026-04-18 04:55:20,081 [INFO] app.pulsar.manager - Transactions for instrument LOAN3: [{'postingdate': '2022-01-31', 'effectivedate': '2022-01-31', 'instrumentid': 'LOAN3', 'subinstrumentid': '1', 'transactiontype': 'Purchase_Principal', 'amount': 200000.0, 'tenantId': 'TNT001', 'createdAt': datetime.datetime(2026, 4, 17, 23, 55, 20, 81714, tzinfo=datetime.timezone.utc)}, {'postingdate': '2022-01-31', 'effectivedate': '2022-01-31', 'instrumentid': 'LOAN3', 'subinstrumentid': '1', 'transactiontype': 'Purchase_Interest', 'amount': 300.0, 'tenantId': 'TNT001', 'createdAt': datetime.datetime(2026, 4, 17, 23, 55, 20, 81716, tzinfo=datetime.timezone.utc)}, {'postingdate': '2022-01-31', 'effectivedate': '2022-01-31', 'instrumentid': 'LOAN3', 'subinstrumentid': '1', 'transactiontype': 'Interest_Accrual', 'amount': 0.0, 'tenantId': 'TNT001', 'createdAt': datetime.datetime(2026, 4, 17, 23, 55, 20, 81716, tzinfo=datetime.timezone.utc)}]
+2026-04-18 04:55:20,082 [INFO] app.pulsar.manager - Transactions for instrument LOAN1: [{'postingdate': '2022-01-31', 'effectivedate': '2022-01-31', 'instrumentid': 'LOAN1', 'subinstrumentid': '1', 'transactiontype': 'Purchase_Principal', 'amount': 100000.0, 'tenantId': 'TNT001', 'createdAt': datetime.datetime(2026, 4, 17, 23, 55, 20, 82217, tzinfo=datetime.timezone.utc)}, {'postingdate': '2022-01-31', 'effectivedate': '2022-01-31', 'instrumentid': 'LOAN1', 'subinstrumentid': '1', 'transactiontype': 'Purchase_Interest', 'amount': 100.0, 'tenantId': 'TNT001', 'createdAt': datetime.datetime(2026, 4, 17, 23, 55, 20, 82217, tzinfo=datetime.timezone.utc)}, {'postingdate': '2022-01-31', 'effectivedate': '2022-01-31', 'instrumentid': 'LOAN1', 'subinstrumentid': '1', 'transactiontype': 'Interest_Accrual', 'amount': 0.0, 'tenantId': 'TNT001', 'createdAt': datetime.datetime(2026, 4, 17, 23, 55, 20, 82218, tzinfo=datetime.timezone.utc)}]
+2026-04-18 04:55:20,082 [INFO] app.pulsar.manager - Python model: completed batch. Instruments=2, Succeeded=2, Failed=0, Tenant=TNT001, PostingDate=20220131
+2026-04-18 04:55:20,082 [INFO] app.pulsar.manager - Last chunk processed for Python model execution. Tenant=TNT001, JobId=job-e4c78271-d347-4ed8-a1b6-f3a77fe0e2ee, Date=20220131
+2026-04-18 05:02:31,786 [INFO] app.pulsar.manager - Stopping Pulsar manager...
+2026-04-18 05:02:32,304 [INFO] app.pulsar.manager - Pulsar connection closed.
+2026-04-18 05:02:32,304 [INFO] app.pulsar.manager - Memcache connection closed.
+2026-04-18 05:02:32,305 [INFO] app.db.mongodb - MongoDB connection closed
+2026-04-18 05:02:32,305 [INFO] app.main - fyntrac-py-model service stopped
+INFO:     Started server process [187349]
+INFO:     Waiting for application startup.
+2026-04-21 01:13:01,430 [INFO] app.main - Starting fyntrac-py-model service on port 8090
+2026-04-21 01:13:01,430 [INFO] app.db.mongodb - Connecting to MongoDB at 127.0.0.1:27017
+2026-04-21 01:13:01,434 [INFO] app.main - MongoDB client initialised
+2026-04-21 01:13:01,434 [INFO] app.pulsar.manager - Connecting to Pulsar at pulsar://localhost:6650
+2026-04-21 01:13:01,436 [INFO] app.pulsar.manager - Pulsar background consumers (EventHistory + PythonModel) and Memcached connected.
+2026-04-21 01:13:01,436 [INFO] app.pulsar.manager - Subscribing to topic: persistent://public/default/event-history-query
+2026-04-21 01:13:01.436 INFO  [140686104308672] Client:86 | Subscribing on Topic :persistent://public/default/event-history-query
+2026-04-21 01:13:01.436 INFO  [140686104308672] ClientConnection:196 | [<none> -> pulsar://localhost:6650] Create ClientConnection, timeout=10000
+2026-04-21 01:13:01.436 INFO  [140686104308672] ConnectionPool:125 | Created connection for pulsar://localhost:6650-pulsar://localhost:6650-0
+2026-04-21 01:13:01.437 INFO  [140685767513792] ClientConnection:416 | [127.0.0.1:54646 -> 127.0.0.1:6650] Connected to broker
+2026-04-21 01:13:01.439 INFO  [140685767513792] HandlerBase:112 | [persistent://public/default/event-history-query, fyntrac-py-model-sub, 0] Getting connection from pool
+2026-04-21 01:13:01.440 INFO  [140685767513792] BinaryProtoLookupService:85 | Lookup response for persistent://public/default/event-history-query, lookup-broker-url pulsar://localhost:6650, from [127.0.0.1:54646 -> 127.0.0.1:6650] 
+2026-04-21 01:13:01.456 INFO  [140685767513792] ConsumerImpl:337 | [persistent://public/default/event-history-query, fyntrac-py-model-sub, 0] Created consumer on broker [127.0.0.1:54646 -> 127.0.0.1:6650] 
+2026-04-21 01:13:01.456 INFO  [140685767513792] HandlerBase:134 | Finished connecting to broker after 16 ms
+2026-04-21 01:13:01.457 INFO  [140685767513792] HandlerBase:112 | [persistent://public/default/event-history-result, ] Getting connection from pool
+2026-04-21 01:13:01.457 INFO  [140685767513792] BinaryProtoLookupService:85 | Lookup response for persistent://public/default/event-history-result, lookup-broker-url pulsar://localhost:6650, from [127.0.0.1:54646 -> 127.0.0.1:6650] 
+2026-04-21 01:13:01.457 INFO  [140685767513792] ProducerImpl:147 | Creating producer for topic:persistent://public/default/event-history-result, producerName: on [127.0.0.1:54646 -> 127.0.0.1:6650] 
+2026-04-21 01:13:01.458 INFO  [140685767513792] ProducerImpl:221 | [persistent://public/default/event-history-result, ] Created producer on broker [127.0.0.1:54646 -> 127.0.0.1:6650] 
+2026-04-21 01:13:01.458 INFO  [140685767513792] HandlerBase:134 | Finished connecting to broker after 1 ms
+2026-04-21 01:13:01,459 [INFO] app.pulsar.manager - Subscribing to Python model execution topic: persistent://public/default/fyntrac-python-model-execution
+2026-04-21 01:13:01.459 INFO  [140686104308672] Client:86 | Subscribing on Topic :persistent://public/default/fyntrac-python-model-execution
+2026-04-21 01:13:01.460 INFO  [140685767513792] HandlerBase:112 | [persistent://public/default/fyntrac-python-model-execution, fyntrac-py-model-execution-sub, 1] Getting connection from pool
+2026-04-21 01:13:01.460 INFO  [140685767513792] BinaryProtoLookupService:85 | Lookup response for persistent://public/default/fyntrac-python-model-execution, lookup-broker-url pulsar://localhost:6650, from [127.0.0.1:54646 -> 127.0.0.1:6650] 
+2026-04-21 01:13:01.472 INFO  [140685767513792] ConsumerImpl:337 | [persistent://public/default/fyntrac-python-model-execution, fyntrac-py-model-execution-sub, 1] Created consumer on broker [127.0.0.1:54646 -> 127.0.0.1:6650] 
+2026-04-21 01:13:01.472 INFO  [140685767513792] HandlerBase:134 | Finished connecting to broker after 12 ms
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8090 (Press CTRL+C to quit)
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+2026-04-21 01:14:05,581 [INFO] app.pulsar.manager - Stopping Pulsar manager...
+2026-04-21 01:14:06.476 INFO  [140686104308672] ConsumerImpl:1361 | [persistent://public/default/event-history-query, fyntrac-py-model-sub, 0] Closing consumer for topic persistent://public/default/event-history-query
+2026-04-21 01:14:06.477 INFO  [140685767513792] ConsumerImpl:1345 | [persistent://public/default/event-history-query, fyntrac-py-model-sub, 0] Closed consumer 0
+2026-04-21 01:14:06.477 INFO  [140686104308672] ProducerImpl:802 | [persistent://public/default/event-history-result, standalone-0-1050] Closing producer for topic persistent://public/default/event-history-result
+2026-04-21 01:14:06.477 INFO  [140685767513792] ProducerImpl:766 | [persistent://public/default/event-history-result, standalone-0-1050] Closed producer 0
+2026-04-21 01:14:06.477 INFO  [140686104308672] ProducerImpl:759 | Producer - [persistent://public/default/event-history-result, standalone-0-1050] , [batching  = off]
+2026-04-21 01:14:06.487 INFO  [140686104308672] ConsumerImpl:1361 | [persistent://public/default/fyntrac-python-model-execution, fyntrac-py-model-execution-sub, 1] Closing consumer for topic persistent://public/default/fyntrac-python-model-execution
+2026-04-21 01:14:06.487 INFO  [140685767513792] ConsumerImpl:1345 | [persistent://public/default/fyntrac-python-model-execution, fyntrac-py-model-execution-sub, 1] Closed consumer 1
+2026-04-21 01:14:06.487 INFO  [140686104308672] ClientImpl:686 | Closing Pulsar client with 0 producers and 0 consumers
+2026-04-21 01:14:06.488 INFO  [140685344765632] ClientConnection:1326 | [127.0.0.1:54646 -> 127.0.0.1:6650] Connection disconnected (refCnt: 2)
+2026-04-21 01:14:06.488 INFO  [140685344765632] ClientConnection:288 | [127.0.0.1:54646 -> 127.0.0.1:6650] Destroyed connection to pulsar://localhost:6650-0
+2026-04-21 01:14:06,488 [INFO] app.pulsar.manager - Pulsar connection closed.
+2026-04-21 01:14:06,488 [INFO] app.pulsar.manager - Memcache connection closed.
+2026-04-21 01:14:06,488 [INFO] app.db.mongodb - MongoDB connection closed
+2026-04-21 01:14:06,488 [INFO] app.main - fyntrac-py-model service stopped
+INFO:     Application shutdown complete.
+INFO:     Finished server process [187349]

@@ -48,6 +48,12 @@ class Settings(BaseSettings):
     PULSAR_PYTHON_MODEL_EXECUTION_TOPIC: str = "persistent://public/default/fyntrac-python-model-execution"
     PULSAR_PYTHON_MODEL_SUBSCRIPTION_NAME: str = "fyntrac-py-model-execution-sub"
 
+    # ── Pulsar — Downstream Producers (mirror Java model service) ────────
+    # Consumed by the Java aggregation service (same topic as Java model uses)
+    PULSAR_AGGREGATION_TOPIC: str = "persistent://public/default/fyntrac-aggregate-execution"
+    # Consumed by the Java GL service (same topic as Java model uses)
+    PULSAR_GL_STAGING_TOPIC: str = "persistent://public/default/fyntrac-book-gl-staging"
+
     # ── Logging ──────────────────────────────────────────────────────────
     LOG_LEVEL: str = "INFO"
 
