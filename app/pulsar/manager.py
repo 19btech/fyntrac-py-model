@@ -42,7 +42,10 @@ class PulsarManager:
         logger.info("Connecting to Pulsar at %s", settings.PULSAR_SERVICE_URL)
         
         try:
-            self._client = pulsar.Client(settings.PULSAR_SERVICE_URL)
+            self._client = pulsar.Client(
+                settings.PULSAR_SERVICE_URL,
+                logger=pulsar.ConsoleLogger(pulsar.LoggerLevel.Error),
+            )
             self._stop_event.clear()
             
             # Setup memcached client

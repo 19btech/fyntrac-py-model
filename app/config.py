@@ -35,13 +35,13 @@ class Settings(BaseSettings):
     CORS_ALLOWED_ORIGINS: str = "http://localhost:3030"
 
     # ── Pulsar ───────────────────────────────────────────────────────────
-    PULSAR_SERVICE_URL: str = "pulsar://localhost:6650"
+    PULSAR_SERVICE_URL: str = "pulsar://pulsar:6650"
     PULSAR_EVENT_HISTORY_QUERY_TOPIC: str = "persistent://public/default/event-history-query"
     PULSAR_EVENT_HISTORY_RESULT_TOPIC: str = "persistent://public/default/event-history-result"
     PULSAR_SUBSCRIPTION_NAME: str = "fyntrac-py-model-sub"
 
     # ── Memcached ────────────────────────────────────────────────────────
-    MEMCACHED_HOST: str = "localhost"
+    MEMCACHED_HOST: str = "memcached"
     MEMCACHED_PORT: int = 11211
 
     # ── Pulsar — Python Model Execution ─────────────────────────────────
