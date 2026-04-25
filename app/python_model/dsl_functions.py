@@ -2,6 +2,18 @@
 # ============= Imports (must be at top) =============
 import math
 from datetime import datetime, timedelta
+
+import threading
+
+# Thread-local storage for DSL state (thread-safe parallel execution)
+_tls = threading.local()
+
+def _get_tls(name, default=None):
+    return getattr(_tls, name, default)
+
+def _set_tls(name, value):
+    setattr(_tls, name, value)
+
 from typing import List, Dict, Any, Optional
 
 
@@ -31,10 +43,11 @@ def safe_eval_expression(expression: str, context: Dict[str, Any]):
     dsl_funcs = globals().get('DSL_FUNCTIONS', {})
     safe_globals.update(dsl_funcs)
 
-    # Lazy-evaluate top-level iif(...) to avoid evaluating both branches
+    # Lazy-evaluate top-level if(...) / iif(...) to avoid evaluating both branches
     expr_str = str(expression).strip()
-    if expr_str.startswith('iif(') and expr_str.endswith(')'):
-        inside = expr_str[len('iif('):-1]
+    _if_prefix = 'iif(' if expr_str.startswith('iif(') else ('if(' if expr_str.startswith('if(') else None)
+    if _if_prefix and expr_str.endswith(')'):
+        inside = expr_str[len(_if_prefix):-1]
         parts = []
         buf = ''
         depth = 0
@@ -58,8 +71,12 @@ def safe_eval_expression(expression: str, context: Dict[str, Any]):
 
     # Evaluate expression using eval with restricted globals and provided locals
     # The context variables are provided as locals so they shadow DSL functions if needed
+    # Replace 'if(' with 'iif(' because 'if' is a Python keyword and cannot be used as a
+    # function name in eval(), even though DSL_FUNCTIONS has 'iif' mapped to if_op.
+    import re as _re
+    expr_for_eval = _re.sub(r'\bif\s*\(', 'iif(', expr_str)
     try:
-        return eval(expression, safe_globals, context or {})
+        return eval(expr_for_eval, safe_globals, context or {})
     except Exception:
         # Re-raise to let callers handle/log; callers often catch and return None
         raise
@@ -171,26 +188,35 @@ def normalize_date(date_value: Any) -> str:
     """
     Normalize a date value to YYYY-MM-DD string format.
     Handles datetime objects, timestamps, and various string formats.
-    
+
     Args:
         date_value: Date in any format (datetime, timestamp, string)
-    
+
     Returns:
         Date string in YYYY-MM-DD format, or empty string if invalid
     """
     if date_value is None:
         return ''
-    
+
+    # Unwrap hybrid context-array (used inside schedule() column expressions)
+    # to its current-row scalar so downstream date parsing sees a string/date,
+    # not the list repr.
+    _RAA = globals().get('_RowAwareArray')
+    if _RAA is not None and isinstance(date_value, _RAA):
+        date_value = date_value._row if date_value._row is not None else ''
+        if date_value is None:
+            return ''
+
     # If already a string, try to parse and reformat
     if isinstance(date_value, str):
         date_str = date_value.strip()
         if not date_str or date_str == 'None':
             return ''
-        
+
         # Already in YYYY-MM-DD format
         if len(date_str) == 10 and date_str[4] == '-' and date_str[7] == '-':
             return date_str
-        
+
         # Try to parse common formats
         for fmt in ['%Y-%m-%dT%H:%M:%S', '%Y-%m-%dT%H:%M:%S.%f', '%Y-%m-%d %H:%M:%S',
                     '%Y-%m-%dT%H:%M:%SZ', '%Y-%m-%d %H:%M:%S.%f',
@@ -200,30 +226,40 @@ def normalize_date(date_value: Any) -> str:
                 return dt.strftime('%Y-%m-%d')
             except ValueError:
                 continue
-        
+
         # If it has a 'T' or space, just take the date part
         if 'T' in date_str:
             return date_str.split('T')[0]
         if ' ' in date_str:
             return date_str.split(' ')[0]
-        
+
         return date_str
-    
+
     # If datetime object
     if isinstance(date_value, datetime):
         return date_value.strftime('%Y-%m-%d')
-    
+
     # If it's a date object (not datetime)
     if hasattr(date_value, 'strftime'):
         return date_value.strftime('%Y-%m-%d')
     
+    # Numeric YYYYMMDD (e.g. 20250131 → "2025-01-31")
+    if isinstance(date_value, (int, float)):
+        n = int(date_value)
+        if 19000101 <= n <= 29991231:
+            y, rest = divmod(n, 10000)
+            m, d = divmod(rest, 100)
+            if 1 <= m <= 12 and 1 <= d <= 31:
+                return f"{y:04d}-{m:02d}-{d:02d}"
+        return ''
+
     # Fallback - convert to string and try to extract date
     str_val = str(date_value).strip()
     if 'T' in str_val:
         return str_val.split('T')[0]
     if ' ' in str_val:
         return str_val.split(' ')[0]
-    
+
     return str_val
 
 
@@ -231,7 +267,7 @@ def normalize_date(date_value: Any) -> str:
 
 def pv(rate: float, n: int, pmt: float, fv: float = 0, type: int = 0) -> float:
     """Calculates present value of future cash flows
-    
+
     Args:
         rate: Interest rate per period
         n: Number of periods
@@ -243,7 +279,7 @@ def pv(rate: float, n: int, pmt: float, fv: float = 0, type: int = 0) -> float:
     n = _coerce_n_to_int(n, 'n')
     if rate == 0:
         return -(fv + pmt * n)
-    
+
     try:
         pv_annuity = pmt * ((1 - (1 + rate) ** (-n)) / rate)
         if type == 1:
@@ -255,7 +291,7 @@ def pv(rate: float, n: int, pmt: float, fv: float = 0, type: int = 0) -> float:
 
 def fv(rate: float, n: int, pmt: float, pv: float = 0, type: int = 0) -> float:
     """Calculates future value
-    
+
     Args:
         rate: Interest rate per period
         n: Number of periods
@@ -266,7 +302,7 @@ def fv(rate: float, n: int, pmt: float, pv: float = 0, type: int = 0) -> float:
     n = _coerce_n_to_int(n, 'n')
     if rate == 0:
         return -(pv + pmt * n)
-    
+
     try:
         fv_lump_sum = -pv * (1 + rate) ** n
         fv_annuity = pmt * (((1 + rate) ** n - 1) / rate)
@@ -278,7 +314,7 @@ def fv(rate: float, n: int, pmt: float, pv: float = 0, type: int = 0) -> float:
 
 def pmt(rate: float, n: int, pv: float, fv: float = 0, type: int = 0) -> float:
     """Fixed periodic payment
-    
+
     Args:
         rate: Interest rate per period
         n: Number of periods
@@ -292,7 +328,7 @@ def pmt(rate: float, n: int, pv: float, fv: float = 0, type: int = 0) -> float:
         return 0
     if rate == 0:
         return -(pv + fv) / n
-    
+
     try:
         factor = (1 + rate) ** n
         if abs(factor - 1) < 1e-12:
@@ -306,10 +342,10 @@ def pmt(rate: float, n: int, pv: float, fv: float = 0, type: int = 0) -> float:
 
 def rate(n: int, pmt: float, pv: float, fv: float = 0, type: int = 0, guess: float = 0.1) -> float:
     """Calculate interest rate per period
-    
+
     Solves the equation: 0 = pv + pmt*(1+rate*type)*[(1+rate)^n - 1]/rate + fv/(1+rate)^n
     Uses Newton-Raphson method.
-    
+
     Args:
         n: Number of periods
         pmt: Payment per period
@@ -317,7 +353,7 @@ def rate(n: int, pmt: float, pv: float, fv: float = 0, type: int = 0, guess: flo
         fv: Future value (default 0)
         type: 0 = payment at end of period (default), 1 = payment at beginning
         guess: Initial guess for rate (default 0.1 = 10%)
-    
+
     Returns:
         Interest rate as decimal (0.1 = 10%)
     """
@@ -325,10 +361,10 @@ def rate(n: int, pmt: float, pv: float, fv: float = 0, type: int = 0, guess: flo
     n = _coerce_n_to_int(n, 'n')
     if n == 0:
         return 0
-    
+
     # For type=1, adjust pmt
     pmt_adj = pmt * (1 + (1 if type == 1 else 0))
-    
+
     rate_est = guess
     max_iterations = 100
     tolerance = 1e-6
@@ -372,14 +408,14 @@ def rate(n: int, pmt: float, pv: float, fv: float = 0, type: int = 0, guess: flo
 
 def nper(rate: float, pmt: float, pv: float, fv: float = 0, type: int = 0) -> float:
     """Calculate number of periods
-    
+
     Args:
         rate: Interest rate per period
         pmt: Payment per period
         pv: Present value
         fv: Future value (default 0)
         type: 0 = payment at end of period (default), 1 = payment at beginning
-    
+
     Returns:
         Number of periods (can be fractional)
     """
@@ -424,37 +460,37 @@ def irr(cashflows: List[float], guess: float = 0.1) -> float:
     """
     Internal rate of return using Newton-Raphson method.
     Returns the rate that makes NPV equal to zero.
-    
+
     Args:
         cashflows: List of cash flows (first is typically negative for investment)
         guess: Initial guess for the rate (default 0.1 = 10%)
-    
+
     Returns:
         IRR as a decimal (0.1 = 10%), or None if no solution found
     """
     if not cashflows or len(cashflows) < 2:
         return 0
-    
+
     rate = guess
     max_iterations = 100
     tolerance = 1e-7
-    
+
     for iteration in range(max_iterations):
         # Calculate NPV at current rate (starting from period 1, like Excel)
         try:
             npv_val = sum(cf / ((1 + rate) ** i) for i, cf in enumerate(cashflows, start=1))
         except (OverflowError, ZeroDivisionError):
             break
-        
+
         if abs(npv_val) < tolerance:
             return rate
-        
+
         # Calculate derivative of NPV
         try:
             dnpv = sum(-i * cf / ((1 + rate) ** (i + 1)) for i, cf in enumerate(cashflows, start=1))
         except (OverflowError, ZeroDivisionError):
             break
-        
+
         # Handle zero derivative (try a different approach)
         if abs(dnpv) < 1e-10:
             # Try bisection or adjust guess
@@ -463,38 +499,38 @@ def irr(cashflows: List[float], guess: float = 0.1) -> float:
             else:
                 rate = rate - 0.01
             continue
-        
+
         # Newton-Raphson update
         new_rate = rate - npv_val / dnpv
-        
+
         # Prevent rate from going too negative or too extreme
         if new_rate < -0.99:
             new_rate = -0.99
         elif new_rate > 10:
             new_rate = 10
-        
+
         # Check for convergence
         if abs(new_rate - rate) < tolerance:
             return new_rate
-        
+
         rate = new_rate
-    
+
     # Return best estimate if no perfect solution found
     return rate
 
 def xnpv(rate: float, cashflows: List[float], dates: List[str]) -> float:
     """NPV with specific dates (matches Excel XNPV)
-    
+
     Args:
         rate: Discount rate
         cashflows: List of cash flows
         dates: List of dates (ISO format: YYYY-MM-DD)
-    
+
     Note: Uses 365 days per year (Excel convention), not 365.25
     """
     if len(cashflows) != len(dates):
         raise ValueError("Cashflows and dates must have same length")
-    
+
     # Normalize and validate dates
     if not dates or len(dates) != len(cashflows):
         raise ValueError("Cashflows and dates must have same length and not be empty")
@@ -517,7 +553,7 @@ def xnpv(rate: float, cashflows: List[float], dates: List[str]) -> float:
 
 def xirr(cashflows: List[float], dates: List[str], guess: float = 0.1) -> float:
     """IRR with specific dates (matches Excel XIRR)
-    
+
     Args:
         cashflows: List of cash flows
         dates: List of dates (ISO format: YYYY-MM-DD)
@@ -525,39 +561,39 @@ def xirr(cashflows: List[float], dates: List[str], guess: float = 0.1) -> float:
     """
     if not cashflows or len(cashflows) < 2:
         return 0
-    
+
     rate = guess
     max_iterations = 100
     tolerance = 1e-6
-    
+
     for iteration in range(max_iterations):
         xnpv_val = xnpv(rate, cashflows, dates)
-        
+
         if abs(xnpv_val) < tolerance:
             return rate
-        
+
         # Derivative approximation
         delta = 0.0001
         xnpv_plus = xnpv(rate + delta, cashflows, dates)
         slope = (xnpv_plus - xnpv_val) / delta
-        
+
         if abs(slope) < 1e-10:
             break
-        
+
         new_rate = rate - xnpv_val / slope
-        
+
         # Prevent rate from going too negative or too extreme
         if new_rate < -0.99:
             new_rate = -0.99
         elif new_rate > 10:
             new_rate = 10
-        
+
         # Check for convergence
         if abs(new_rate - rate) < tolerance:
             return new_rate
-        
+
         rate = new_rate
-    
+
     return rate
 
 def discount_factor(rate: float, dcf: float) -> float:
@@ -588,113 +624,78 @@ def yield_to_maturity(price: float, face: float, coupon: float, years: float) ->
     return ytm_approx
 
 # Interest Functions
-def compound_interest(principal: float, rate: float, periods: int) -> float:
-    """Compound interest"""
-    try:
-        return principal * ((1 + rate) ** periods - 1)
-    except OverflowError:
-        raise ValueError(f"compound_interest: overflow — rate must be decimal (e.g., 0.05 for 5%, not 5), got rate={rate}, periods={periods}")
 
-def interest_on_balance(balance: float, rate: float, days: int) -> float:
-    """Interest using ACT/360"""
-    return balance * rate * (days / 360)
 
-def capitalization(interest: float, balance: float) -> float:
-    """Add interest to principal"""
-    return balance + interest
 
-def amortized_cost(opening: float, interest: float, payment: float) -> float:
-    """Balance after payment"""
-    return opening + interest - payment
 
 
 
 # Depreciation
-def straight_line(cost: float, salvage: float, life: int) -> float:
-    """Straight-line depreciation"""
-    life = _coerce_n_to_int(life, 'life')
-    if life == 0:
-        raise ValueError("straight_line: life must be greater than zero")
-    return (cost - salvage) / life
 
-def reducing_balance(cost: float, rate: float) -> float:
-    """Declining balance"""
-    return cost * rate
 
-def double_declining(cost: float, life: int) -> float:
-    """Double declining balance"""
-    life = _coerce_n_to_int(life, 'life')
-    if life == 0:
-        raise ValueError("double_declining: life must be greater than zero")
-    return cost * (2 / life)
 
-def sum_of_years(cost: float, salvage: float, life: int, year: int) -> float:
-    """Sum of years digits"""
-    total_years = sum(range(1, life + 1))
-    if total_years == 0:
-        return 0
-    return ((cost - salvage) * (life - year + 1)) / total_years
 
-def units_of_production(cost: float, units: float, total: float) -> float:
-    """Usage-based depreciation"""
-    return cost * (units / total) if total > 0 else 0
 
 # Allocation
-def prorate(value: float, part: float, total: float) -> float:
-    """Proportional allocation"""
-    return value * (part / total) if total > 0 else 0
 
-def allocate(value: float, weights: List[float]) -> List[float]:
-    """Weight-based allocation"""
-    total_weight = sum(weights)
-    if total_weight == 0:
-        return [0] * len(weights)
-    return [value * (w / total_weight) for w in weights]
 
-def split(value: float, n: int) -> float:
-    """Equal split"""
-    n = _coerce_n_to_int(n, 'n')
-    return value / n if n > 0 else 0
 
-def percentage_of(value: float, pct: float) -> float:
-    """Calculate percentage"""
-    return value * pct
 
-def ratio_split(value: float, ratios: List[float]) -> List[float]:
-    """Split by ratios"""
-    return allocate(value, ratios)
 
 # Balance Functions
-def rolling_balance(opening: float, flows: List[float]) -> float:
-    """Running balance"""
-    return opening + sum(flows)
 
-def average_balance(balances: List[float]) -> float:
-    """Average of balances"""
-    return sum(balances) / len(balances) if balances else 0
 
-def weighted_balance(balances: List[float], days: List[int]) -> float:
-    """Weighted average balance"""
-    if not balances or not days or len(balances) != len(days):
-        return 0
-    total_days = sum(days)
-    return sum(b * d for b, d in zip(balances, days)) / total_days if total_days > 0 else 0
 
 # Arithmetic
-def add(a: float, b: float) -> float:
-    return to_number(a) + to_number(b)
+def _broadcast_binary(a, b, op_name, scalar_op):
+    """Apply ``scalar_op(x, y)`` element-wise when either input is a list/tuple.
 
-def subtract(a: float, b: float) -> float:
-    return to_number(a) - to_number(b)
+    Rules:
+    - both list-like → element-wise on the *shorter* length (avoids silent zero-padding bugs)
+    - one list-like, one scalar → broadcast the scalar over the list
+    - both scalar → return ``scalar_op(a, b)``
 
-def multiply(a: float, b: float) -> float:
-    return to_number(a) * to_number(b)
+    Note: `_RowAwareArray` (the hybrid context-array type used inside
+    schedule() column expressions) is treated as a scalar so a context array
+    referenced bare (e.g. `multiply(openingBalance, Monthly_Rate)`) operates
+    on the current row's value, not the whole array.
+    """
+    # Defer import to avoid forward-reference issues; class is defined below.
+    _RAA = globals().get('_RowAwareArray')
+    if _RAA is not None:
+        if isinstance(a, _RAA):
+            a = a._row if a._row is not None else 0
+        if isinstance(b, _RAA):
+            b = b._row if b._row is not None else 0
+    a_is_list = isinstance(a, (list, tuple))
+    b_is_list = isinstance(b, (list, tuple))
+    if not a_is_list and not b_is_list:
+        return scalar_op(to_number(a), to_number(b))
+    if a_is_list and b_is_list:
+        n = min(len(a), len(b))
+        return [scalar_op(to_number(a[i]), to_number(b[i])) for i in range(n)]
+    if a_is_list:
+        bv = to_number(b)
+        return [scalar_op(to_number(x), bv) for x in a]
+    av = to_number(a)
+    return [scalar_op(av, to_number(x)) for x in b]
 
-def divide(a: float, b: float) -> float:
-    denom = to_number(b)
-    if denom == 0:
-        raise ValueError("Division by zero")
-    return to_number(a) / denom
+
+def add(a, b):
+    return _broadcast_binary(a, b, 'add', lambda x, y: x + y)
+
+def subtract(a, b):
+    return _broadcast_binary(a, b, 'subtract', lambda x, y: x - y)
+
+def multiply(a, b):
+    return _broadcast_binary(a, b, 'multiply', lambda x, y: x * y)
+
+def divide(a, b):
+    def _div(x, y):
+        if y == 0:
+            raise ValueError("Division by zero")
+        return x / y
+    return _broadcast_binary(a, b, 'divide', _div)
 
 def power(a: float, b: float) -> float:
     try:
@@ -704,10 +705,6 @@ def power(a: float, b: float) -> float:
     except (ValueError, ZeroDivisionError):
         raise ValueError(f"power({a}, {b}): mathematically undefined (e.g., negative base with fractional exponent or 0 to negative power)")
 
-def sqrt(x: float) -> float:
-    if x < 0:
-        raise ValueError(f"sqrt: input must be >= 0, got {x}")
-    return math.sqrt(x)
 
 def abs_val(x: float) -> float:
     return abs(x)
@@ -719,6 +716,10 @@ def to_number(x: Any) -> float:
     """
     if x is None:
         return 0
+    # Unwrap hybrid context-array to its current-row scalar.
+    _RAA = globals().get('_RowAwareArray')
+    if _RAA is not None and isinstance(x, _RAA):
+        x = x._row if x._row is not None else 0
     if isinstance(x, (int, float)):
         return x
     # Strings: empty or 'None' -> 0, else try float conversion
@@ -748,10 +749,6 @@ def floor(x: float) -> int:
 def ceil(x: float) -> int:
     return math.ceil(x)
 
-def mod(a: float, b: float) -> float:
-    if b == 0:
-        raise ValueError("mod: divisor b cannot be zero")
-    return a % b
 
 def truncate(x: float, decimals: int = 0) -> float:
     """Truncate to decimals"""
@@ -762,31 +759,79 @@ def percentage(value: float, total: float) -> float:
     """Calculate percentage of total"""
     return (value / total * 100) if total != 0 else 0
 
-def change_pct(old: float, new: float) -> float:
-    """Percentage change"""
-    return ((new - old) / old * 100) if old != 0 else 0
 
 # Comparison
+# ---------------------------------------------------------------------------
+# All comparison functions are date-aware: they unwrap _RowAwareArray,
+# coerce datetime objects and YYYYMMDD numbers to normalized date strings,
+# and compare properly regardless of the incoming format.
+# ---------------------------------------------------------------------------
+def _unwrap_row_aware(val):
+    """Unwrap _RowAwareArray to its current-row scalar if applicable."""
+    _RAA = globals().get('_RowAwareArray')
+    if _RAA is not None and isinstance(val, _RAA):
+        return val._row if val._row is not None else 0
+    return val
+
+def _is_date_like(val):
+    """Quick check: does this value look like it might be a date?"""
+    if isinstance(val, datetime):
+        return True
+    if hasattr(val, 'strftime'):
+        return True
+    if isinstance(val, (int, float)):
+        n = int(val)
+        return 19000101 <= n <= 29991231
+    if isinstance(val, str):
+        s = val.strip()
+        return len(s) >= 8 and ('-' in s or '/' in s)
+    return False
+
+def _coerce_for_comparison(a, b):
+    """Unwrap _RowAwareArray + normalize dates for comparison."""
+    a = _unwrap_row_aware(a)
+    b = _unwrap_row_aware(b)
+    if _is_date_like(a) or _is_date_like(b):
+        na = normalize_date(a)
+        nb = normalize_date(b)
+        if na and nb:
+            return na, nb
+    return a, b
+
 def eq(a: Any, b: Any) -> bool:
+    a, b = _coerce_for_comparison(a, b)
     return a == b
 
 def neq(a: Any, b: Any) -> bool:
+    a, b = _coerce_for_comparison(a, b)
     return a != b
 
-def gt(a: float, b: float) -> bool:
+def gt(a: Any, b: Any) -> bool:
+    a, b = _coerce_for_comparison(a, b)
     return a > b
 
-def gte(a: float, b: float) -> bool:
+def gte(a: Any, b: Any) -> bool:
+    a, b = _coerce_for_comparison(a, b)
     return a >= b
 
-def lt(a: float, b: float) -> bool:
+def lt(a: Any, b: Any) -> bool:
+    a, b = _coerce_for_comparison(a, b)
     return a < b
 
-def lte(a: float, b: float) -> bool:
+def lte(a: Any, b: Any) -> bool:
+    a, b = _coerce_for_comparison(a, b)
     return a <= b
 
-def between(x: float, l: float, u: float) -> bool:
+def between(x: Any, l: Any, u: Any) -> bool:
+    x = _unwrap_row_aware(x)
+    l = _unwrap_row_aware(l)
+    u = _unwrap_row_aware(u)
+    if _is_date_like(x) or _is_date_like(l) or _is_date_like(u):
+        nx, nl, nu = normalize_date(x), normalize_date(l), normalize_date(u)
+        if nx and nl and nu:
+            return nl <= nx <= nu
     return l <= x <= u
+
 
 def is_null(x: Any) -> bool:
     # Treat None, empty strings, and the literal 'None' (case-insensitive)
@@ -799,13 +844,7 @@ def is_null(x: Any) -> bool:
             return True
     return False
 
-def is_positive(x: float) -> bool:
-    """Check if positive"""
-    return x > 0
 
-def is_negative(x: float) -> bool:
-    """Check if negative"""
-    return x < 0
 
 # Logical
 def and_op(a: bool, b: bool) -> bool:
@@ -817,8 +856,6 @@ def or_op(a: bool, b: bool) -> bool:
 def not_op(a: bool) -> bool:
     return not a
 
-def xor(a: bool, b: bool) -> bool:
-    return a != b
 
 def all_op(lst: List[bool]) -> bool:
     return all(lst)
@@ -835,8 +872,6 @@ def coalesce(*args) -> Any:
             return arg
     return None
 
-def clamp(x: float, min_val: float, max_val: float) -> float:
-    return max(min_val, min(x, max_val))
 
 def switch(value: Any, cases: Dict[Any, Any], default_val: Any = None) -> Any:
     """Switch-case logic"""
@@ -913,7 +948,7 @@ def add_months(d: str, n: int) -> str:
     month = date.month + n
     year = date.year + (month - 1) // 12
     month = (month - 1) % 12 + 1
-    
+
     # Clamp day to valid range for target month
     # Get last day of target month
     if month == 12:
@@ -921,7 +956,7 @@ def add_months(d: str, n: int) -> str:
     else:
         next_month_first = datetime(year, month + 1, 1)
         last_day = (next_month_first - timedelta(days=1)).day
-    
+
     day = min(date.day, last_day)
     return f"{year:04d}-{month:02d}-{day:02d}"
 
@@ -933,12 +968,12 @@ def add_years(d: str, n: int) -> str:
         return ''
     date = datetime.fromisoformat(nd)
     target_year = date.year + n
-    
+
     # Handle Feb 29 -> Feb 28 for non-leap years
     if date.month == 2 and date.day == 29:
         if not (target_year % 4 == 0 and (target_year % 100 != 0 or target_year % 400 == 0)):
             return f"{target_year:04d}-02-28"
-    
+
     return f"{target_year:04d}-{date.month:02d}-{date.day:02d}"
 
 def subtract_days(d: str, n: int) -> str:
@@ -1050,30 +1085,119 @@ def business_days(d1: str, d2: str) -> int:
 
 # ============= Schedule Functions =============
 
-def period(start: str, end: str, freq: str = "M", convention: str = "ACT/360") -> Dict[str, Any]:
+def period(start, end=None, freq: str = "M", convention: str = "ACT/360") -> Dict[str, Any]:
     """
     Creates a period definition for schedule generation.
-    
+
     Args:
-        start: Start date (YYYY-MM-DD)
-        end: End date (YYYY-MM-DD)
+        start: Start date (YYYY-MM-DD), OR an integer/numeric count of periods
+               when ``end`` is omitted. In count form the schedule is anchored
+               at the current posting date and advances by ``freq``.
+        end: End date (YYYY-MM-DD). Optional when ``start`` is a count.
         freq: Frequency - M (monthly), Q (quarterly), A (annual), D (daily), W (weekly)
         convention: Day count convention - ACT/360, ACT/365, 30/360
-    
+
     Returns:
         Period definition object with dates list
     """
+    # Count form: period(N) or period(N, freq) — anchor at current posting date
+    # and emit N period dates advancing by freq. If end is a string that doesn't
+    # parse as a date but start is numeric, treat the string as freq.
+    def _as_count(v):
+        if isinstance(v, bool):
+            return None
+        if isinstance(v, int):
+            return v
+        if isinstance(v, float) and v.is_integer():
+            return int(v)
+        if isinstance(v, str):
+            s = v.strip()
+            if s.isdigit():
+                return int(s)
+            try:
+                f = float(s)
+                if f.is_integer():
+                    return int(f)
+            except Exception:
+                return None
+        return None
+
+    count = _as_count(start) if end is None else None
+    # Simpler: if end is None, treat start as count.
+    # Also handle period(count, "M") where end is a freq code, not a date.
+    _FREQ_CODES = {"M", "Q", "A", "Y", "W", "D"}
+    if end is not None and isinstance(end, str) and end.strip().upper() in _FREQ_CODES and _as_count(start) is not None:
+        freq = end.strip().upper()
+        end = None
+    if end is None:
+        count = _as_count(start)
+        if count is None:
+            # Nothing usable — return empty period
+            return {"type": "period", "start": start, "end": end, "freq": freq, "convention": convention, "dates": []}
+        anchor = _get_current_postingdate() or datetime.now().strftime("%Y-%m-%d")
+        nd = normalize_date(anchor) or anchor
+        try:
+            start_date = datetime.fromisoformat(nd)
+        except Exception:
+            return {"type": "period", "start": anchor, "end": None, "freq": freq, "convention": convention, "dates": []}
+        dates = []
+        current = start_date
+        for _ in range(max(0, count)):
+            dates.append(current.strftime("%Y-%m-%d"))
+            if freq == "M":
+                month = current.month + 1; year = current.year
+                if month > 12: month = 1; year += 1
+                try: current = current.replace(year=year, month=month)
+                except ValueError:
+                    nxt = current.replace(year=year+1, month=1, day=1) if month == 12 else current.replace(year=year, month=month+1, day=1)
+                    current = nxt - timedelta(days=1)
+            elif freq == "Q":
+                month = current.month + 3; year = current.year
+                while month > 12: month -= 12; year += 1
+                try: current = current.replace(year=year, month=month)
+                except ValueError:
+                    nxt = current.replace(year=year+1, month=1, day=1) if month == 12 else current.replace(year=year, month=month+1, day=1)
+                    current = nxt - timedelta(days=1)
+            elif freq == "A":
+                current = current.replace(year=current.year + 1)
+            elif freq == "W":
+                current = current + timedelta(weeks=1)
+            elif freq == "D":
+                current = current + timedelta(days=1)
+            else:
+                month = current.month + 1; year = current.year
+                if month > 12: month = 1; year += 1
+                try: current = current.replace(year=year, month=month)
+                except ValueError:
+                    nxt = current.replace(year=year+1, month=1, day=1) if month == 12 else current.replace(year=year, month=month+1, day=1)
+                    current = nxt - timedelta(days=1)
+        return {
+            "type": "period",
+            "start": dates[0] if dates else None,
+            "end": dates[-1] if dates else None,
+            "freq": freq,
+            "convention": convention,
+            "dates": dates,
+            "count": count,
+        }
+
     # Support passing arrays of start/end dates to create per-item schedules implicitly.
     if isinstance(start, list) and isinstance(end, list):
         if len(start) != len(end):
             raise ValueError("start and end arrays must have the same length")
-        return {
+        # Carry subinstrument_ids through if either array is an _ScheduleValueList
+        # so downstream schedule() can map results back to the right sub-instruments
+        sub_ids = getattr(start, 'subinstrument_ids', None) or getattr(end, 'subinstrument_ids', None)
+        out = {
             "type": "period_array",
             "start_dates": start,
             "end_dates": end,
             "freq": freq,
             "convention": convention,
         }
+        if sub_ids:
+            out["subinstrument_ids"] = list(sub_ids)
+        return out
 
     # If either date is empty or invalid, return an empty period (no dates)
     if not start or not end:
@@ -1109,13 +1233,13 @@ def period(start: str, end: str, freq: str = "M", convention: str = "ACT/360") -
             "convention": convention,
             "dates": []
         }
-    
+
     dates = []
     current = start_date
-    
+
     while current <= end_date:
         dates.append(current.strftime("%Y-%m-%d"))
-        
+
         if freq == "M":
             # Monthly - advance to same day next month
             month = current.month + 1
@@ -1172,7 +1296,7 @@ def period(start: str, end: str, freq: str = "M", convention: str = "ACT/360") -
                 else:
                     next_month = current.replace(year=year, month=month+1, day=1)
                 current = next_month - timedelta(days=1)
-    
+
     return {
         "type": "period",
         "start": start,
@@ -1186,10 +1310,10 @@ def period(start: str, end: str, freq: str = "M", convention: str = "ACT/360") -
 def schedule(period_def: Dict[str, Any], columns: Dict[str, str], context: Dict[str, Any] = None) -> List[Dict[str, Any]]:
     """
     Creates a deterministic time-based schedule (table).
-    
-    Used for: revenue schedules, FAS-91 fee amortization, loan amortization, 
+
+    Used for: revenue schedules, FAS-91 fee amortization, loan amortization,
     depreciation, pricing, accruals, and accounting timelines.
-    
+
     Args:
         period_def: Period definition from period() function
         columns: Dictionary of column names to expressions
@@ -1202,10 +1326,10 @@ def schedule(period_def: Dict[str, Any], columns: Dict[str, str], context: Dict[
                  - All DSL functions: days_between, end_of_month, start_of_month, etc.
         context: Optional dictionary of external variables to make available in expressions
                  Example: {"initial_balance": 100000, "rate": 0.05}
-    
+
     Returns:
         List of dictionaries containing ONLY the columns you define
-    
+
     Example:
         schedule(
             period("2024-01-01", "2024-06-01", "M"),
@@ -1215,7 +1339,7 @@ def schedule(period_def: Dict[str, Any], columns: Dict[str, str], context: Dict[
                 "revenue": "12000 / 12"
             }
         )
-        
+
         # With external context:
         schedule(
             period("2024-01-01", "2024-06-01", "M"),
@@ -1223,7 +1347,7 @@ def schedule(period_def: Dict[str, Any], columns: Dict[str, str], context: Dict[
             {"initial_balance": 100000, "payment": 5000}
         )
     """
-    global _in_schedule_evaluation
+    # _in_schedule_evaluation tracked via TLS
     # Support alternative calling convention: schedule(COLUMNS, CONTEXT)
     # If the first arg looks like columns (dict of expressions) and the
     # second arg is a dict of arrays/context, swap them so `period_def` is None.
@@ -1253,6 +1377,11 @@ def schedule(period_def: Dict[str, Any], columns: Dict[str, str], context: Dict[
         else:
             item_names = None
             subinstrument_ids = None
+
+        # Fall back to ids carried on the period descriptor (propagated from
+        # collect_by_instrument via period(start_dates, end_dates, ...))
+        if not subinstrument_ids:
+            subinstrument_ids = period_def.get('subinstrument_ids')
 
         # Normalize amounts into a list matching start_dates length
         if amounts is None:
@@ -1296,7 +1425,7 @@ def schedule(period_def: Dict[str, Any], columns: Dict[str, str], context: Dict[
                 return val
 
             # Evaluate columns for each item producing a single unified schedule (list of rows)
-            _in_schedule_evaluation += 1
+            _set_tls("in_schedule_evaluation", _get_tls("in_schedule_evaluation", 0) + 1)
             try:
                 result = []
                 computed_columns = {col: [] for col in columns.keys()}
@@ -1417,11 +1546,11 @@ def schedule(period_def: Dict[str, Any], columns: Dict[str, str], context: Dict[
 
                 return result
             finally:
-                _in_schedule_evaluation -= 1
+                _set_tls("in_schedule_evaluation", max(0, _get_tls("in_schedule_evaluation", 0) - 1))
 
         # Otherwise return empty (no period and no arrays to infer rows)
         return []
-    
+
     dates = period_def.get("dates", [])
     convention = period_def.get("convention", "ACT/360")
 
@@ -1431,11 +1560,11 @@ def schedule(period_def: Dict[str, Any], columns: Dict[str, str], context: Dict[
     # Mark that we're evaluating schedule column expressions to prevent
     # schedule helper re-entrancy (calling schedule helpers from inside
     # schedule column expressions can lead to recursion / confusing results).
-    _in_schedule_evaluation += 1
+    _set_tls("in_schedule_evaluation", _get_tls("in_schedule_evaluation", 0) + 1)
     try:
         result = []
         computed_columns = {col: [] for col in columns.keys()}
-    
+
         # Get DSL_FUNCTIONS from the module's global scope (defined at bottom of file)
         # This avoids circular import issues
         dsl_funcs = globals().get('DSL_FUNCTIONS', {})
@@ -1445,16 +1574,19 @@ def schedule(period_def: Dict[str, Any], columns: Dict[str, str], context: Dict[
         if context and isinstance(context, dict):
             n_dates = len(dates)
             for k, v in context.items():
-                # If already a list, ensure it's at least n_dates long (pad with last or zeros)
+                # If already a list, ensure it's at least n_dates long.
+                # Pad short arrays with None (NOT the last value) so out-of-bounds
+                # periods are treated as "missing" — `coalesce(arr, 0)` returns 0,
+                # `array_get` sees a None element, and `_RowAwareArray._r()` falls
+                # back to 0 for arithmetic. Repeating the last value would cause
+                # e.g. replay_remit=[50,275,350] over 4 periods to incorrectly
+                # report 350 in period 4 instead of 0.
                 if isinstance(v, list):
                     arr = list(v)
                     if len(arr) < n_dates:
-                        if arr:
-                            arr = arr + [arr[-1]] * (n_dates - len(arr))
-                        else:
-                            arr = [0] * n_dates
+                        arr = arr + [None] * (n_dates - len(arr))
                 elif v is None:
-                    arr = [0] * n_dates
+                    arr = [None] * n_dates
                 else:
                     # Scalar: broadcast to full-length array
                     arr = [v] * n_dates
@@ -1496,14 +1628,22 @@ def schedule(period_def: Dict[str, Any], columns: Dict[str, str], context: Dict[
             eval_context = {}
             eval_context.update(dsl_funcs)
 
-            # Inject normalized per-row context values and expose full arrays as `<name>_full`
+            # Inject context arrays as a hybrid object that behaves as both:
+            #   - the full array (for lookup/iteration/indexing/len)
+            #   - the current row's scalar (for arithmetic/eq/compare)
+            # This means a context array `ExpectedCF` can be used in
+            # `lookup(ExpectedCF, StartDate, month_end)` AND in
+            # `multiply(ExpectedCF, rate)` from the same column expression
+            # without needing a `_full` suffix. The `_full` alias is still
+            # exposed for backward compatibility.
             if normalized_arrays:
                 for k, arr in normalized_arrays.items():
+                    row_val = arr[idx] if idx < len(arr) else 0
                     try:
                         eval_context[f"{k}_full"] = arr
                     except Exception:
                         eval_context[f"{k}_full"] = list(arr)
-                    eval_context[k] = arr[idx] if idx < len(arr) else 0
+                    eval_context[k] = _RowAwareArray(arr, row_value=row_val)
 
             # Now add/override with schedule-specific context
             eval_context.update({
@@ -1560,10 +1700,11 @@ def schedule(period_def: Dict[str, Any], columns: Dict[str, str], context: Dict[
                     try:
                         # Evaluate expression with full DSL context using safe evaluator
                         expr_str = str(expression)
-                        # Lazy-evaluate top-level iif(...) to avoid evaluating both branches
+                        # Lazy-evaluate top-level if(...) / iif(...) to avoid evaluating both branches
                         def _eval_iif_top(expr):
-                            # expects expr starting with iif(
-                            inside = expr[len('iif('):-1]
+                            # expects expr starting with if( or iif(
+                            _pfx = 'iif(' if expr.startswith('iif(') else 'if('
+                            inside = expr[len(_pfx):-1]
                             # split top-level commas into three parts
                             parts = []
                             buf = ''
@@ -1588,13 +1729,21 @@ def schedule(period_def: Dict[str, Any], columns: Dict[str, str], context: Dict[
                             chosen = true_expr if cond_val else false_expr
                             return safe_eval_expression(chosen, eval_context)
 
-                        if expr_str.strip().startswith('iif(') and expr_str.strip().endswith(')'):
-                            value = _eval_iif_top(expr_str.strip())
+                        _if_stripped = expr_str.strip()
+                        _if_pfx = 'iif(' if _if_stripped.startswith('iif(') else ('if(' if _if_stripped.startswith('if(') else None)
+                        if _if_pfx and _if_stripped.endswith(')'):
+                            value = _eval_iif_top(_if_stripped)
                         else:
                             value = safe_eval_expression(expr_str, eval_context)
                         # Guard: DSL functions must not return None inside schedule - replace None with 0 or []
                         if value is None:
                             value = 0
+                        # If a column expression returned the hybrid context-array
+                        # object directly (e.g. `UPB` referenced bare), unwrap it
+                        # to the current row's scalar so the cell stores a single
+                        # value instead of the full array's repr.
+                        if isinstance(value, _RowAwareArray):
+                            value = value._row if value._row is not None else 0
                     except Exception as e:
                         value = f"ERROR: {str(e)}"
 
@@ -1611,10 +1760,187 @@ def schedule(period_def: Dict[str, Any], columns: Dict[str, str], context: Dict[
                 if not (isinstance(value, str) and str(value).startswith("ERROR")):
                     eval_context[col_name] = value
 
+            # Tag the row with the current (instrument, posting date) at the
+            # moment of generation so the Business Preview can strictly scope
+            # schedule display. We tag here (not at print time) because users
+            # may print schedules via plain print(), bypassing print_schedule.
+            try:
+                _iid = _get_current_instrumentid()
+                if _iid not in (None, "") and '_instrumentid' not in row:
+                    row['_instrumentid'] = _iid
+                _pd = _get_current_postingdate()
+                if _pd not in (None, "") and '_postingdate' not in row:
+                    row['_postingdate'] = _pd
+            except Exception:
+                pass
+
             result.append(row)
         return result
     finally:
-        _in_schedule_evaluation -= 1
+        _set_tls("in_schedule_evaluation", max(0, _get_tls("in_schedule_evaluation", 0) - 1))
+
+
+class _ScheduleValueList(list):
+    """A list that also carries the sub-instrument ids associated with each entry.
+
+    Returned by `schedule_sum`, `schedule_first`, `schedule_last`, `schedule_filter`
+    and `schedule_column` when the source `schedule()` produced one schedule per
+    sub-instrument.  `createTransaction` reads `.subinstrument_ids` to align each
+    amount entry with the correct sub-instrument id, eliminating ordering bugs
+    when a separate `subinstrumentid` variable is passed.
+    """
+    __slots__ = ('subinstrument_ids',)
+
+    def __init__(self, iterable=(), subinstrument_ids=None):
+        super().__init__(iterable)
+        self.subinstrument_ids = list(subinstrument_ids) if subinstrument_ids is not None else None
+
+
+class _RowAwareArray(list):
+    """A list that ALSO behaves as the current-row scalar in arithmetic/comparisons.
+
+    Used inside schedule() column expressions so a context array (e.g. ExpectedCF)
+    can be referenced by its bare name and work both as:
+      - a full array (lookup, len, iteration, indexing) - default list behavior
+      - the current row's value (multiply, add, eq, comparisons) - via _row
+
+    The per-row scalar is stored on `_row`; numeric/comparison dunders fall
+    through to `_row` so `multiply(openingBalance, Monthly_Rate)` keeps working
+    when `Monthly_Rate` is a context array but the formula expects a scalar.
+    """
+    __slots__ = ('_row',)
+
+    def __new__(cls, iterable=(), row_value=None):
+        return super().__new__(cls, iterable)
+
+    def __init__(self, iterable=(), row_value=None):
+        super().__init__(iterable)
+        self._row = row_value
+
+    # Numeric scalar coercion
+    def __float__(self):
+        try:
+            return float(self._row) if self._row is not None else 0.0
+        except (TypeError, ValueError):
+            return 0.0
+
+    def __int__(self):
+        try:
+            return int(self._row) if self._row is not None else 0
+        except (TypeError, ValueError):
+            return 0
+
+    def __bool__(self):
+        return bool(self._row) if self._row is not None else len(self) > 0
+
+    # Arithmetic - delegate to per-row scalar
+    def _r(self):
+        return self._row if self._row is not None else 0
+
+    def __add__(self, other):
+        if isinstance(other, list) and not isinstance(other, _RowAwareArray):
+            return list.__add__(self, other)
+        return self._r() + other
+
+    def __radd__(self, other):
+        return other + self._r()
+
+    def __sub__(self, other):
+        return self._r() - other
+
+    def __rsub__(self, other):
+        return other - self._r()
+
+    def __mul__(self, other):
+        if isinstance(other, int) and not isinstance(other, bool) and self._row is None:
+            return list.__mul__(self, other)
+        return self._r() * other
+
+    def __rmul__(self, other):
+        return other * self._r()
+
+    def __truediv__(self, other):
+        return self._r() / other
+
+    def __rtruediv__(self, other):
+        return other / self._r()
+
+    def __floordiv__(self, other):
+        return self._r() // other
+
+    def __rfloordiv__(self, other):
+        return other // self._r()
+
+    def __mod__(self, other):
+        return self._r() % other
+
+    def __rmod__(self, other):
+        return other % self._r()
+
+    def __pow__(self, other):
+        return self._r() ** other
+
+    def __rpow__(self, other):
+        return other ** self._r()
+
+    def __neg__(self):
+        return -self._r()
+
+    def __pos__(self):
+        return +self._r()
+
+    def __abs__(self):
+        return abs(self._r())
+
+    # Comparisons - default list compares lexicographically; we want scalar
+    # semantics when the other side is a scalar (number/str/date), and list
+    # semantics when comparing to another list.
+    def _cmp(self, other, op):
+        if isinstance(other, list) and not isinstance(other, _RowAwareArray):
+            return op(list(self), other)
+        return op(self._r(), other)
+
+    def __eq__(self, other):
+        import operator
+        return self._cmp(other, operator.eq)
+
+    def __ne__(self, other):
+        import operator
+        return self._cmp(other, operator.ne)
+
+    def __lt__(self, other):
+        import operator
+        return self._cmp(other, operator.lt)
+
+    def __le__(self, other):
+        import operator
+        return self._cmp(other, operator.le)
+
+    def __gt__(self, other):
+        import operator
+        return self._cmp(other, operator.gt)
+
+    def __ge__(self, other):
+        import operator
+        return self._cmp(other, operator.ge)
+
+    def __hash__(self):
+        # Required because __eq__ is overridden; hash by row scalar so it can
+        # appear in dict keys / sets when scalar-like.
+        try:
+            return hash(self._row)
+        except TypeError:
+            return id(self)
+
+
+def _extract_sub_ids(sched):
+    """Pull the per-schedule subinstrument_id list from a generate_schedules result.
+
+    Returns None if the schedule isn't in the per-sub-instrument shape.
+    """
+    if isinstance(sched, list) and sched and isinstance(sched[0], dict) and 'schedule' in sched[0]:
+        return [r.get('subinstrument_id') for r in sched]
+    return None
 
 
 def schedule_sum(sched: List[Dict[str, Any]], column: str) -> float:
@@ -1632,7 +1958,10 @@ def schedule_sum(sched: List[Dict[str, Any]], column: str) -> float:
 
     # generate_schedules results: list of result dicts -> return list of totals
     if isinstance(sched, list) and sched and isinstance(sched[0], dict) and 'schedule' in sched[0]:
-        return [_sum_rows(r.get('schedule', []) or []) for r in sched]
+        return _ScheduleValueList(
+            (_sum_rows(r.get('schedule', []) or []) for r in sched),
+            subinstrument_ids=_extract_sub_ids(sched),
+        )
 
     # list of schedule arrays (multiple schedules passed as list) -> return list of totals
     if isinstance(sched, list) and sched and isinstance(sched[0], list):
@@ -1662,7 +1991,10 @@ def schedule_last(sched: List[Dict[str, Any]], column: str) -> float:
 
     # generate_schedules results -> list of last values
     if isinstance(sched, list) and sched and isinstance(sched[0], dict) and 'schedule' in sched[0]:
-        return [_last_single(r.get('schedule', []) or []) for r in sched]
+        return _ScheduleValueList(
+            (_last_single(r.get('schedule', []) or []) for r in sched),
+            subinstrument_ids=_extract_sub_ids(sched),
+        )
 
     # list of schedule arrays -> list of last values
     if isinstance(sched, list) and sched and isinstance(sched[0], list):
@@ -1689,7 +2021,10 @@ def schedule_first(sched: List[Dict[str, Any]], column: str) -> float:
 
     # generate_schedules results -> list of first values
     if isinstance(sched, list) and sched and isinstance(sched[0], dict) and 'schedule' in sched[0]:
-        return [_first_single(r.get('schedule', []) or []) for r in sched]
+        return _ScheduleValueList(
+            (_first_single(r.get('schedule', []) or []) for r in sched),
+            subinstrument_ids=_extract_sub_ids(sched),
+        )
 
     # list of schedule arrays -> list of first values
     if isinstance(sched, list) and sched and isinstance(sched[0], list):
@@ -1721,7 +2056,10 @@ def schedule_column(sched: List[Dict[str, Any]], column: str) -> List[Any]:
 
     # generate_schedules results: list of dicts with 'schedule' key
     if isinstance(sched, list) and sched and isinstance(sched[0], dict) and 'schedule' in sched[0]:
-        return [_col_values(r.get('schedule', []) or []) for r in sched]
+        return _ScheduleValueList(
+            (_col_values(r.get('schedule', []) or []) for r in sched),
+            subinstrument_ids=_extract_sub_ids(sched),
+        )
 
     # list of schedule arrays -> list of lists
     if isinstance(sched, list) and sched and isinstance(sched[0], list):
@@ -1826,7 +2164,10 @@ def schedule_filter(sched: List[Dict[str, Any]], match_column: str, match_value:
 
     # generate_schedules results (each item includes schedule + context like posting_date)
     if isinstance(sched, list) and sched and isinstance(sched[0], dict) and 'schedule' in sched[0]:
-        return [_find_value(r.get('schedule', []) or [], r) for r in sched]
+        return _ScheduleValueList(
+            (_find_value(r.get('schedule', []) or [], r) for r in sched),
+            subinstrument_ids=_extract_sub_ids(sched),
+        )
 
     # list of schedule arrays
     if isinstance(sched, list) and sched and isinstance(sched[0], list):
@@ -1834,7 +2175,7 @@ def schedule_filter(sched: List[Dict[str, Any]], match_column: str, match_value:
 
     # single schedule -> single-entry list
     return [_find_value(sched)]
-    
+
 
 
 # ============= Generic Multi-Item Schedule Generation =============
@@ -1916,7 +2257,7 @@ def generate_schedules(
 ) -> List[Dict[str, Any]]:
     """
     Generate schedules for multiple items - FULLY GENERIC.
-    
+
     Creates one schedule per item. Works for any time-based allocation:
     - Revenue recognition (ASC 606)
     - Expense amortization
@@ -1924,7 +2265,7 @@ def generate_schedules(
     - FAS-91 fee amortization
     - Asset depreciation
     - Lease schedules (ASC 842)
-    
+
     Args:
         amounts: Array of amounts per item (revenue, cost, principal, etc.)
         start_dates: Array of start dates per item
@@ -1934,7 +2275,7 @@ def generate_schedules(
         context: Additional variables for expressions (e.g., {"rate": 0.05})
         item_names: Optional names for each item (for display)
         subinstrument_ids: Optional sub-instrument IDs for each item
-    
+
     Returns:
         List of schedule result objects, each containing:
         - item_index: Index of the item
@@ -1946,7 +2287,7 @@ def generate_schedules(
         - total_periods: Number of periods
         - schedule: The generated schedule (array of rows)
         - total: Sum of period amounts
-    
+
     Available variables in column expressions:
         - amount: The allocated amount for this item
         - total_periods: Number of periods in schedule
@@ -1956,7 +2297,7 @@ def generate_schedules(
         - item_name: Name of current item
         - subinstrument_id: Subinstrument ID
         - Any variables passed in context
-    
+
     Example:
         results = generate_schedules(
             [800, 400, 0],
@@ -1976,17 +2317,17 @@ def generate_schedules(
     """
     if not amounts or not start_dates or not end_dates or not columns:
         return []
-    
+
     n = min(len(amounts), len(start_dates), len(end_dates))
     results = []
-    
+
     for i in range(n):
         amount = amounts[i] if i < len(amounts) else 0
         start = start_dates[i] if i < len(start_dates) else None
         end = end_dates[i] if i < len(end_dates) else None
         name = item_names[i] if item_names and i < len(item_names) else f"Item {i + 1}"
         subinstrument = subinstrument_ids[i] if subinstrument_ids and i < len(subinstrument_ids) else str(i + 1)
-        
+
         result = {
             "item_index": i,
             "item_name": name,
@@ -2005,21 +2346,37 @@ def generate_schedules(
             for k, v in context.items():
                 if k not in result:
                     result[k] = v
-        
-        # If start or end date missing for this item, raise a clear DSL-level error
-        if not start or not end:
-            raise ValueError(f"Schedule could not be created for subInstrumentId {subinstrument} — start_date or end_date is missing")
 
-        # Skip items with zero amount
-        if not amount or amount == 0:
+        # If start or end date missing for this item, skip schedule generation
+        # for this sub-instrument but emit an empty placeholder row. This keeps
+        # downstream arrays (schedule_filter, schedule_sum, etc.) index-aligned
+        # with parallel collect_by_instrument() arrays so the
+        # subinstrument↔value relationship is preserved across all steps.
+        if not start or not end:
+            result["_skipped_reason"] = "missing start_date or end_date"
             results.append(result)
             continue
-        
+
         # Generate period definition
         period_def = period(start, end, freq)
         total_periods = len(period_def.get("dates", []))
         result["total_periods"] = total_periods
-        
+
+        # Skip items with zero amount only when no other context arrays exist
+        # AND at least one column formula actually references 'amount' — pure
+        # calendar/date schedules (e.g. period_date, month_end) should always
+        # generate rows even when no monetary amount is provided.
+        _skip_keys = ('amounts', 'amount', 'start_dates', 'end_dates',
+                      'subinstrument_ids', 'item_names', 'product_names')
+        has_other_arrays = context and any(
+            isinstance(v, list) and k not in _skip_keys
+            for k, v in context.items()
+        )
+        has_amount_col = any('amount' in str(v) for v in columns.values())
+        if not has_other_arrays and (not amount or amount == 0) and has_amount_col:
+            results.append(result)
+            continue
+
         # Build context for schedule expressions
         sched_context = {
             "amount": amount,
@@ -2030,39 +2387,45 @@ def generate_schedules(
             "start_date": start,
             "end_date": end
         }
-        
-        # Add user-provided context
+
+        # Add user-provided context — auto-extract per-item values from arrays
         if context:
-            sched_context.update(context)
-        
+            for k, v in context.items():
+                if k in _skip_keys:
+                    continue  # already handled by dedicated parameters
+                if isinstance(v, list):
+                    sched_context[k] = v[i] if i < len(v) else (v[-1] if v else None)
+                else:
+                    sched_context[k] = v
+
         # Generate the schedule
         sched = schedule(period_def, columns, sched_context)
         result["schedule"] = sched
-        
+
         # Calculate total (look for period_amount, period_revenue, period_accrual, etc.)
         total = 0
-        amount_columns = ["period_amount", "period_revenue", "period_accrual", 
+        amount_columns = ["period_amount", "period_revenue", "period_accrual",
                          "period_amortization", "period_depreciation", "lease_expense"]
         for col in amount_columns:
             if sched and col in sched[0]:
                 total = schedule_sum(sched, col)
                 break
         result["total"] = total
-        
+
         results.append(result)
-    
+
     return results
 
 
 def get_schedules_array(results: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
     """
     Extract just the schedule arrays from generate_schedules results.
-    
+
     Useful for passing to print_all_schedules or other functions.
-    
+
     Args:
         results: Results from generate_schedules()
-    
+
     Returns:
         Array of schedule arrays
     """
@@ -2072,11 +2435,11 @@ def get_schedules_array(results: List[Dict[str, Any]]) -> List[List[Dict[str, An
 def get_schedule_totals(results: List[Dict[str, Any]], column: str = None) -> List[float]:
     """
     Extract the totals from generate_schedules results.
-    
+
     Args:
         results: Results from generate_schedules()
         column: Optional column name to sum. If not provided, uses the default total.
-    
+
     Returns:
         Array of totals (one per item)
     """
@@ -2093,12 +2456,12 @@ def find_period_amounts(
 ) -> List[Dict[str, Any]]:
     """
     Find the period amounts for each item based on posting date.
-    
+
     Args:
         results: Results from generate_schedules()
         posting_date: The posting date to match
         amount_column: Column name to extract (auto-detected if not specified)
-    
+
     Returns:
         Array of recognition results with:
         - item_index, item_name, subinstrument_id
@@ -2107,9 +2470,9 @@ def find_period_amounts(
     """
     if not results or not posting_date:
         return []
-    
+
     recognition = []
-    
+
     for r in results:
         sched = r.get("schedule", [])
         rec = {
@@ -2119,7 +2482,7 @@ def find_period_amounts(
             "period_date": None,
             "period_amount": 0
         }
-        
+
         if sched:
             # Inline period-match logic (previously schedule_find_period)
             try:
@@ -2159,9 +2522,9 @@ def find_period_amounts(
                         if col in matched_row:
                             rec["period_amount"] = matched_row.get(col, 0)
                             break
-        
+
         recognition.append(rec)
-    
+
     return recognition
 
 
@@ -2172,21 +2535,21 @@ def create_schedule_transactions(
 ) -> List[Dict[str, Any]]:
     """
     Create transactions from schedule recognition results.
-    
+
     Only creates transactions for items with non-zero amounts.
-    
+
     Args:
         recognition_results: Results from find_period_amounts()
         posting_date: Transaction posting date
         transaction_type: Transaction type/description
-    
+
     Returns:
         List of created transactions
     """
-    global _transaction_results, _current_instrumentid
-    
+    # TLS: _transaction_results, _get_tls("current_instrumentid")
+
     created = []
-    
+
     for r in recognition_results:
         amount = r.get("period_amount", 0)
         if amount and amount != 0:
@@ -2199,33 +2562,53 @@ def create_schedule_transactions(
             )
             if txn:
                 created.append(txn)
-    
+
     return created
 
 
 def print_schedule(sched: List[Dict[str, Any]], title: str = "Schedule") -> List[Dict[str, Any]]:
     """
     Print a schedule as a formatted table in the console.
-    
+
     Args:
         sched: Schedule to print
         title: Title for the schedule
-    
+
     Returns:
         The schedule (for chaining)
     """
     import json
-    
+
     if not sched:
         _dsl_print(f"{title}: (Empty schedule)")
         return sched
-    
+
     _dsl_print(f"═══ {title} ═══")
+    # Tag each printed row with the current (_instrumentid, _postingdate) so
+    # the Business Preview can strictly scope schedule display to the
+    # filtered instrument AND selected posting date. We clone the rows so the
+    # caller's in-memory schedule object is untouched.
     try:
-        _dsl_print(json.dumps(sched, indent=2, default=str))
+        _iid = _get_current_instrumentid()
+        _pd = _get_current_postingdate()
+        tagged = []
+        for _r in sched:
+            if isinstance(_r, dict):
+                _row = dict(_r)
+                if '_instrumentid' not in _row:
+                    _row['_instrumentid'] = _iid
+                if '_postingdate' not in _row and _pd:
+                    _row['_postingdate'] = _pd
+                tagged.append(_row)
+            else:
+                tagged.append(_r)
     except Exception:
-        _dsl_print(str(sched))
-    
+        tagged = sched
+    try:
+        _dsl_print(json.dumps(tagged, indent=2, default=str))
+    except Exception:
+        _dsl_print(str(tagged))
+
     return sched
 
 
@@ -2235,17 +2618,17 @@ def print_all_schedules(
 ) -> List[Any]:
     """
     Print all schedules from generate_schedules results or schedule arrays.
-    
+
     Args:
         schedules_or_results: Results from generate_schedules() or array of schedules
         item_names: Optional names for each schedule
-    
+
     Returns:
         The input (for chaining)
     """
     if not schedules_or_results:
         return schedules_or_results
-    
+
     # Check if this is generate_schedules results (has 'schedule' key) or raw schedule arrays
     if schedules_or_results and isinstance(schedules_or_results[0], dict) and 'schedule' in schedules_or_results[0]:
         # This is generate_schedules results
@@ -2264,7 +2647,7 @@ def print_all_schedules(
                 print_schedule(sched, name)
             else:
                 _dsl_print(f"{name}: (Empty)")
-    
+
     return schedules_or_results
 
 
@@ -2288,22 +2671,12 @@ def contains(s: str, substring: str) -> bool:
     return str(substring) in str(s)
 
 def eq_ignore_case(a: str, b: str) -> bool:
-    """Case-insensitive string equality"""
+    """Case-insensitive string equality (also trims surrounding whitespace)."""
     if a is None or b is None:
         return a is None and b is None
-    return str(a).lower() == str(b).lower()
+    return str(a).strip().lower() == str(b).strip().lower()
 
-def starts_with(s: str, prefix: str) -> bool:
-    """Check if string starts with prefix"""
-    if s is None or prefix is None:
-        return False
-    return str(s).startswith(str(prefix))
 
-def ends_with(s: str, suffix: str) -> bool:
-    """Check if string ends with suffix"""
-    if s is None or suffix is None:
-        return False
-    return str(s).endswith(str(suffix))
 
 def trim(s: str) -> str:
     """Remove leading and trailing whitespace"""
@@ -2320,14 +2693,14 @@ def sum_vals(col: List[float]) -> float:
 
 def sum_field(array: List[Dict], field: str) -> float:
     """Sum a specific field from an array of objects/dictionaries.
-    
+
     Args:
         array: List of dictionaries
         field: Name of field to sum
-        
+
     Returns:
         Sum of field values (None values treated as 0)
-        
+
     Example:
         sum_field(recognition_results, "period_amount")
     """
@@ -2441,177 +2814,143 @@ def median(col: List[float]) -> float:
         return (sorted_col[n//2-1] + sorted_col[n//2]) / 2
     return sorted_col[n//2]
 
-def variance(col: List[float]) -> float:
-    if not col:
-        return 0
-    mu = avg(col)
-    return sum((x - mu) ** 2 for x in col) / len(col)
 
 def std_dev(col: List[float]) -> float:
-    return math.sqrt(variance(col))
-
-def percentile(col: List[float], p: float) -> float:
-    """Calculate percentile"""
     if not col:
         return 0
-    sorted_col = sorted(col)
-    k = (len(sorted_col) - 1) * p
-    f = math.floor(k)
-    c = math.ceil(k)
-    if f == c:
-        return sorted_col[int(k)]
-    return sorted_col[int(f)] * (c - k) + sorted_col[int(c)] * (k - f)
+    mean = sum(col) / len(col)
+    return math.sqrt(sum((x - mean) ** 2 for x in col) / len(col))
+
 
 def range_val(col: List[float]) -> float:
     """Range of values"""
     return max_val(col) - min_val(col) if col else 0
 
 # Conversion
-def fx_convert(v: float, rate: float) -> float:
-    return v * rate
 
-def normalize(v: float, base: float) -> float:
-    return v / base if base != 0 else 0
 
-def basis_points(rate: float) -> float:
-    return rate * 10000
 
-def from_bps(bps: float) -> float:
-    return bps / 10000
 
-def to_percentage(decimal: float) -> float:
-    """Convert decimal to percentage"""
-    return decimal * 100
 
-def from_percentage(pct: float) -> float:
-    """Convert percentage to decimal"""
-    return pct / 100
 
 # Statistical
-def correlation(x: List[float], y: List[float]) -> float:
-    """Pearson correlation coefficient"""
-    if len(x) != len(y) or not x:
-        return 0
-    mean_x = avg(x)
-    mean_y = avg(y)
-    numerator = sum((xi - mean_x) * (yi - mean_y) for xi, yi in zip(x, y))
-    denominator = math.sqrt(sum((xi - mean_x) ** 2 for xi in x) * sum((yi - mean_y) ** 2 for yi in y))
-    return numerator / denominator if denominator != 0 else 0
 
-def covariance(x: List[float], y: List[float]) -> float:
-    """Covariance between two lists"""
-    if len(x) != len(y) or not x:
-        return 0
-    mean_x = avg(x)
-    mean_y = avg(y)
-    return sum((xi - mean_x) * (yi - mean_y) for xi, yi in zip(x, y)) / len(x)
 
-def zscore(value: float, mean_val: float, std: float) -> float:
-    """Z-score"""
-    return (value - mean_val) / std if std != 0 else 0
 
 
 # ============= Transaction Functions =============
 
 # Global list to store transactions created by createTransaction
-_transaction_results = []
+# _transaction_results handled via TLS
 
 # Global list to store print outputs from print_schedule functions
-_print_outputs = []
+# _print_outputs handled via TLS
 
 # Global print function that can be overridden by server.py
-_dsl_print_func = None
+# _dsl_print_func handled via TLS
 
 def _set_dsl_print(print_func):
     """Set the DSL print function (called from server.py generated code)"""
-    global _dsl_print_func
-    _dsl_print_func = print_func
+    # TLS: _get_tls("dsl_print_func")
+    _set_tls("dsl_print_func", print_func)
 
 def _dsl_print(msg):
     """Internal print that uses the DSL print function if set, otherwise appends to _print_outputs"""
-    global _dsl_print_func, _print_outputs
-    if _dsl_print_func:
-        _dsl_print_func(msg)
+    # TLS: _get_tls("dsl_print_func"), _print_outputs
+    if _get_tls("dsl_print_func"):
+        _get_tls("dsl_print_func")(msg)
     else:
-        _print_outputs.append(str(msg))
+        _get_tls("print_outputs", []).append(str(msg))
 
 def _set_print_outputs(outputs_list):
     """Set the global print outputs list (called from server.py)"""
-    global _print_outputs
-    _print_outputs = outputs_list
+    # TLS: _print_outputs
+    _set_tls("print_outputs", outputs_list)
 
 def _get_print_outputs():
     """Get the global print outputs list"""
-    global _print_outputs
-    return _print_outputs
+    # TLS: _print_outputs
+    return _get_tls("print_outputs", [])
 
 def _clear_print_outputs():
     """Clear the print outputs list"""
-    global _print_outputs
-    _print_outputs = []
+    _set_tls("print_outputs", [])
 
 def _set_transaction_results(results_list):
     """Set the global transaction results list (called from server.py)"""
-    global _transaction_results
-    _transaction_results = results_list
+    # TLS: _transaction_results
+    _set_tls("transaction_results", results_list)
 
 def _get_transaction_results():
     """Get the global transaction results list"""
-    global _transaction_results
-    return _transaction_results
+    # TLS: _transaction_results
+    return _get_tls("transaction_results", [])
 
 def _clear_transaction_results():
     """Clear the transaction results list"""
-    global _transaction_results
-    _transaction_results = []
+    _set_tls("transaction_results", [])
 
 # Global variable to hold the current instrumentid (set by server.py during execution)
-_current_instrumentid = "STANDALONE"
+# _current_instrumentid handled via TLS (default: "STANDALONE")
+
+# Global variable to hold the current postingdate (set by server.py during execution
+# alongside _get_tls("current_instrumentid")). Used by print_schedule() to tag emitted schedule
+# rows so the Business Preview can scope them to the right (instrument, posting date).
+_current_postingdate = ""
 
 # Guard to detect evaluation inside `schedule()` to prevent helper re-entrancy
-_in_schedule_evaluation = 0
+# _in_schedule_evaluation handled via TLS
 
 def _set_current_instrumentid(instrumentid: str):
     """Set the current instrumentid for transactions"""
-    global _current_instrumentid
-    _current_instrumentid = instrumentid
+    # TLS: _get_tls("current_instrumentid")
+    _set_tls("current_instrumentid", instrumentid)
 
 def _get_current_instrumentid():
     """Get the current instrumentid"""
-    global _current_instrumentid
-    return _current_instrumentid
+    # TLS: _get_tls("current_instrumentid")
+    return _get_tls("current_instrumentid")
+
+def _set_current_postingdate(postingdate: str):
+    """Set the current postingdate (used to tag emitted schedule rows)."""
+    # TLS: _current_postingdate
+    _current_postingdate = str(postingdate) if postingdate is not None else ""
+
+def _get_current_postingdate():
+    """Get the current postingdate."""
+    # TLS: _current_postingdate
+    return _get_tls("current_postingdate")
 
 
 def _in_schedule_eval():
     """Return True if we are currently evaluating a schedule's column expressions."""
-    global _in_schedule_evaluation
-    return _in_schedule_evaluation > 0
+    return _get_tls('in_schedule_evaluation', 0) > 0
 
 def createTransaction(postingdate: Any, effectivedate: Any, transactiontype: Any, amount: Any, subinstrumentid: Any = '1') -> Any:
     """
     Create a transaction with all required fields.
-    
+
     This is the ONLY way to emit transactions in DSL code.
     The instrumentid is automatically set based on the current data row context.
-    
+
     If postingdate or effectivedate is empty/missing (indicating event data not found),
     the transaction will be skipped gracefully.
-    
+
     Args:
         postingdate: Transaction posting date (YYYY-MM-DD format)
         effectivedate: Transaction effective date (YYYY-MM-DD format)
         transactiontype: Type/description of the transaction
         amount: Transaction amount
-        subinstrumentid: Sub-instrument identifier (default '1')
-    
+        subinstrumentid: Sub-instrument identifier (default '1.0')
+
     Returns:
         The created transaction dictionary, or None if skipped due to missing dates
-    
+
     Example:
         createTransaction("2024-01-15", "2024-01-15", "Interest Accrual", 1250.50)
         createTransaction(postingdate, effectivedate, "Fee Income", fee_amount, "PROD-001")
     """
-    global _transaction_results, _current_instrumentid
+    # TLS: _transaction_results, _get_tls("current_instrumentid")
 
     # Helper to normalize input to list
     def _to_list(x):
@@ -2625,7 +2964,17 @@ def createTransaction(postingdate: Any, effectivedate: Any, transactiontype: Any
     effective_list = _to_list(effectivedate)
     type_list = _to_list(transactiontype)
     amount_list = _to_list(amount)
-    sub_list = _to_list(subinstrumentid) or ['1']
+    sub_list = _to_list(subinstrumentid) or ['1.0']
+
+    # If `amount` is a schedule-derived list that carries the per-entry
+    # sub-instrument ids (e.g., from schedule_filter / schedule_sum), prefer
+    # those ids — they guarantee per-row alignment of amount → sub-instrument.
+    # The caller-supplied sub_list is overridden because passing a separately
+    # collected sub-id list (different ordering) is the most common cause of
+    # misaligned transactions.
+    embedded_sub_ids = getattr(amount, 'subinstrument_ids', None)
+    if embedded_sub_ids and isinstance(amount, list) and len(embedded_sub_ids) == len(amount):
+        sub_list = [str(s) if s is not None else '1.0' for s in embedded_sub_ids]
 
     created = []
 
@@ -2680,6 +3029,15 @@ def createTransaction(postingdate: Any, effectivedate: Any, transactiontype: Any
             return 0.0
 
     # Normalize mapping: all fields are mapped by sub-instrument index.
+    # If sub_list has 1 item but amount_list has M items, broadcast sub_list to M
+    # (M transactions all mapped to the same sub-instrument).
+    if len(sub_list) == 1 and len(amount_list) > 1:
+        sub_list = sub_list * len(amount_list)
+    # If amount_list is shorter than sub_list, only create transactions for the
+    # first len(amount_list) sub-instruments. This supports the case where the
+    # variable provides amounts for a subset of sub-instruments.
+    if 1 < len(amount_list) < len(sub_list):
+        sub_list = sub_list[:len(amount_list)]
     N = len(sub_list)
 
     def _validate_and_broadcast(vals, name):
@@ -2689,6 +3047,8 @@ def createTransaction(postingdate: Any, effectivedate: Any, transactiontype: Any
             return [vals[0]] * N
         if len(vals) == N:
             return list(vals)
+        if len(vals) > N:
+            return list(vals)[:N]
         raise ValueError(f"Length of '{name}' ({len(vals)}) must be 1 or equal to number of subInstrumentIds ({N})")
 
     posting_map = _validate_and_broadcast(posting_list, 'postingdate')
@@ -2700,15 +3060,17 @@ def createTransaction(postingdate: Any, effectivedate: Any, transactiontype: Any
         amount_map = [amount_list[0]] * N
     elif len(amount_list) == N:
         amount_map = list(amount_list)
+    elif len(amount_list) > N:
+        amount_map = list(amount_list)[:N]
     else:
         raise ValueError(f"Length of 'amount' ({len(amount_list)}) must be 1 or equal to number of subInstrumentIds ({N})")
 
     # Create exactly one transaction per sub-instrument (unless skipped due to missing dates)
     for i in range(N):
         sub_id_raw = sub_list[i]
-        sub_id = str(sub_id_raw).strip() if sub_id_raw is not None else '1'
+        sub_id = str(sub_id_raw).strip() if sub_id_raw is not None else '1.0'
         if not sub_id or sub_id == 'None':
-            sub_id = '1'
+            sub_id = '1.0'
 
         posting_raw = posting_map[i]
         effective_raw = effective_map[i]
@@ -2746,16 +3108,19 @@ def createTransaction(postingdate: Any, effectivedate: Any, transactiontype: Any
         except Exception:
             amt_num = 0.0
 
+        # Round to 4 decimal places by default
+        amt_num = round(amt_num, 4)
+
         txn = {
             'postingdate': posting_str,
             'effectivedate': effective_str,
-            'instrumentid': _current_instrumentid,
+            'instrumentid': _get_tls("current_instrumentid"),
             'subinstrumentid': sub_id,
             'transactiontype': str(type_raw) if type_raw is not None else '',
             'amount': amt_num
         }
 
-        _transaction_results.append(txn)
+        _get_tls("transaction_results", []).append(txn)
         created.append(txn)
 
     if not created:
@@ -2769,35 +3134,35 @@ def for_each(dates_array: List[str], amounts_array: List[float], date_var: str, 
     """
     Iterate over paired arrays and execute an expression for each pair.
     Creates multiple transactions from multi-row event data.
-    
+
     Args:
         dates_array: Array of effective dates (from collect())
         amounts_array: Array of amounts (from collect())
         date_var: Variable name for date in expression (e.g., "edate")
         amount_var: Variable name for amount in expression (e.g., "amt")
         expression: DSL expression to execute (typically createTransaction)
-    
+
     Returns:
         List of results from each iteration
-    
+
     Example:
         for_each(INT_ACC_effectivedates_arr, INT_ACC_amounts_arr,
             "edate", "amt", "createTransaction(postingdate, edate, 'Cash Flow', amt)")
     """
-    global _current_instrumentid
-    
+    # TLS: _get_tls("current_instrumentid")
+
     results = []
-    
+
     # Ensure arrays are same length
-    min_len = min(len(dates_array) if dates_array else 0, 
+    min_len = min(len(dates_array) if dates_array else 0,
                   len(amounts_array) if amounts_array else 0)
-    
+
     if min_len == 0:
         return results
-    
+
     # Get DSL_FUNCTIONS from module globals to avoid import issues
     dsl_funcs = globals().get('DSL_FUNCTIONS', {})
-    
+
     for i in range(min_len):
         # Create local context with current values
         local_context = {
@@ -2806,10 +3171,10 @@ def for_each(dates_array: List[str], amounts_array: List[float], date_var: str, 
             'index': i,
             'postingdate': dates_array[i],  # Also provide postingdate for convenience
         }
-        
+
         # Add all DSL functions to context
         local_context.update(dsl_funcs)
-        
+
         try:
             result = safe_eval_expression(expression, local_context)
             if result is not None:
@@ -2817,39 +3182,39 @@ def for_each(dates_array: List[str], amounts_array: List[float], date_var: str, 
         except Exception:
             # Skip failed iterations silently
             pass
-    
+
     return results
 
 
 def for_each_with_index(array: List[Any], var_name: str, expression: str, context: Dict[str, Any] = None) -> List[Any]:
     """
     Iterate over a single array and execute an expression for each element.
-    
+
     Args:
         array: Array to iterate over
         var_name: Variable name for current element in expression
         expression: DSL expression to execute
         context: Optional dictionary of external variables (other arrays, totals, etc.)
-    
+
     Returns:
         List of results from each iteration
-    
+
     Example:
         for_each_with_index(amounts_arr, "amt", "amt * 1.1")
-        
+
         # With context for accessing other arrays:
-        for_each_with_index(product_names, "name", 
-            "iif(eq(name.lower(), 'discount'), 0, array_get(esp_values, index, 0))",
+        for_each_with_index(product_names, "name",
+            "if(eq(name.lower(), 'discount'), 0, array_get(esp_values, index, 0))",
             {"esp_values": [1200, 800, -200]})
     """
     results = []
-    
+
     if not array:
         return results
-    
+
     # Get DSL_FUNCTIONS from module globals to avoid import issues
     dsl_funcs = globals().get('DSL_FUNCTIONS', {})
-    
+
     for i, item in enumerate(array):
         local_context = {
             var_name: item,
@@ -2861,79 +3226,95 @@ def for_each_with_index(array: List[Any], var_name: str, expression: str, contex
         # Add external context variables (can override DSL functions if needed)
         if context:
             local_context.update(context)
-        
+
         try:
             # Allow only safe DSL expressions
             result = safe_eval_expression(expression, local_context)
             results.append(result)
         except Exception:
             results.append(None)
-    
+
     return results
 
 
-def map_array(array: List[Any], var_name: str, expression: str, context: Dict[str, Any] = None) -> List[Any]:
+
+
+def apply_each(source, expr_or_second, expr_if_paired=None, context: Dict[str, Any] = None) -> List[Any]:
     """
-    Transform each element of an array using an expression.
-    Similar to for_each_with_index but focused on transformation.
-    
+    Apply a formula to each item in a list, or to each pair of items from two lists.
+    Uses intuitive keywords: 'each' for the current item, 'first'/'second' for paired items.
+
+    Single-array mode:
+        apply_each(array, "formula using each")
+        e.g. apply_each(prices, "multiply(each, 1.1)")
+
+    Paired-array mode:
+        apply_each(array1, array2, "formula using first and second")
+        e.g. apply_each(quantities, prices, "multiply(first, second)")
+
+    Magic variables available inside the formula:
+        each  — current element (single mode) or alias for first (paired mode)
+        first — element from the first array (paired mode)
+        second— element from the second array (paired mode)
+        index — 0-based position in the array
+        count — total number of elements
+
     Args:
-        array: Array to transform
-        var_name: Variable name for current element
-        expression: Transformation expression
-        context: Optional dictionary of external variables (other arrays, totals, etc.)
-    
+        source: The array to iterate over
+        expr_or_second: Expression string (single mode) or second array (paired mode)
+        expr_if_paired: Expression string when using paired mode (None for single mode)
+        context: Optional dict of external variables referenced in the formula
+
     Returns:
-        Transformed array
-    
-    Example:
-        map_array(amounts_arr, "x", "x * 1.1")  # Apply 10% increase
-        map_array(dates_arr, "d", "add_days(d, 30)")  # Shift all dates
-        
-        # With context:
-        map_array(names, "n", "iif(eq(n, 'Discount'), 0, array_get(values, index, 0))", {"values": [100, 200]})
+        List of results from applying the formula to each element/pair
     """
     import logging
     logger = logging.getLogger(__name__)
 
-    mapped = for_each_with_index(array, var_name, expression, context)
-    # Convert None results (evaluation errors) to a safe numeric default (0)
-    cleaned = []
-    for i, v in enumerate(mapped):
-        if v is None:
-            logger.debug(f"map_array: expression evaluation returned None at index {i} for var '{var_name}'")
-            cleaned.append(0)
-        else:
-            cleaned.append(v)
-    return cleaned
+    # Detect mode: if expr_or_second is a string, it's single-array mode
+    if isinstance(expr_or_second, str):
+        # Single-array mode — delegate to for_each_with_index with var_name="each"
+        # 3rd arg could be context dict (passed as expr_if_paired positionally)
+        ctx = expr_if_paired if isinstance(expr_if_paired, dict) else context
+        enriched_context = dict(ctx) if ctx else {}
+        return for_each_with_index(source, "each", expr_or_second, enriched_context)
+    else:
+        # Paired-array mode
+        second_array = expr_or_second
+        expression = expr_if_paired or ""
+
+        if not source or not second_array:
+            return []
+
+        min_len = min(len(source), len(second_array))
+        dsl_funcs = globals().get('DSL_FUNCTIONS', {})
+        results = []
+
+        for i in range(min_len):
+            local_context = {
+                'first': source[i],
+                'second': second_array[i],
+                'each': source[i],      # alias for first
+                'index': i,
+                'count': min_len,
+            }
+            local_context.update(dsl_funcs)
+            if context:
+                local_context.update(context)
+
+            try:
+                result = safe_eval_expression(expression, local_context)
+                if result is None:
+                    logger.debug(f"apply_each paired: expression returned None at index {i}")
+                    results.append(0)
+                else:
+                    results.append(result)
+            except Exception:
+                results.append(0)
+
+        return results
 
 
-def zip_arrays(*arrays) -> List[List[Any]]:
-    """
-    Combine multiple arrays into array of tuples/lists.
-    Useful for parallel iteration.
-    
-    Args:
-        *arrays: Variable number of arrays to zip
-    
-    Returns:
-        List of lists, where each inner list contains elements at same index
-    
-    Example:
-        zip_arrays(dates_arr, amounts_arr, types_arr)
-        -> [["2024-01-15", 1000, "CF"], ["2024-02-15", 1000, "CF"], ...]
-    """
-    if not arrays:
-        return []
-    
-    min_len = min(len(arr) for arr in arrays if arr)
-    result = []
-    
-    for i in range(min_len):
-        row = [arr[i] if arr and i < len(arr) else None for arr in arrays]
-        result.append(row)
-    
-    return result
 
 
 def array_length(array: List[Any]) -> int:
@@ -2995,29 +3376,29 @@ def array_extend(array: List[Any], items: List[Any]) -> List[Any]:
 def array_filter(array: List[Any], var_name: str, condition: str, context: Dict[str, Any] = None) -> List[Any]:
     """
     Filter array elements based on a condition.
-    
+
     Args:
         array: Array to filter
         var_name: Variable name for current element
         condition: Boolean expression to filter by
         context: Optional dictionary of external variables
-    
+
     Returns:
         Filtered array
-    
+
     Example:
         array_filter(amounts_arr, "x", "x > 1000")  # Keep amounts > 1000
-        
+
         # With context:
         array_filter(names, "n", "neq(array_get(amounts, index, 0), 0)", {"amounts": [100, 0, 200]})
     """
     if not array:
         return []
-    
+
     # Get DSL_FUNCTIONS from module globals to avoid import issues
     dsl_funcs = globals().get('DSL_FUNCTIONS', {})
     results = []
-    
+
     for i, item in enumerate(array):
         local_context = {
             var_name: item,
@@ -3033,7 +3414,7 @@ def array_filter(array: List[Any], var_name: str, condition: str, context: Dict[
                 results.append(item)
         except Exception:
             pass
-    
+
     return results
 
 
@@ -3108,6 +3489,290 @@ def dsl_print(*args) -> None:
         _dsl_print(' '.join(map(str, args)))
 
 # Function Registry
+
+# ============= Additional Utility Functions =============
+
+def allocate(value: float, weights: List[float]) -> List[float]:
+    """Weight-based allocation"""
+    total_weight = sum(weights)
+    if total_weight == 0:
+        return [0] * len(weights)
+    return [value * (w / total_weight) for w in weights]
+
+def amortized_cost(opening: float, interest: float, payment: float) -> float:
+    """Balance after payment"""
+    return opening + interest - payment
+
+
+
+# Depreciation
+
+def average_balance(balances: List[float]) -> float:
+    """Average of balances"""
+    return sum(balances) / len(balances) if balances else 0
+
+def basis_points(rate: float) -> float:
+    return rate * 10000
+
+def capitalization(interest: float, balance: float) -> float:
+    """Add interest to principal"""
+    return balance + interest
+
+def change_pct(old: float, new: float) -> float:
+    """Percentage change"""
+    return ((new - old) / old * 100) if old != 0 else 0
+
+# Comparison
+# ---------------------------------------------------------------------------
+# All comparison functions are date-aware: they unwrap _RowAwareArray,
+# coerce datetime objects and YYYYMMDD numbers to normalized date strings,
+# and compare properly regardless of the incoming format.
+# ---------------------------------------------------------------------------
+
+def clamp(x: float, min_val: float, max_val: float) -> float:
+    return max(min_val, min(x, max_val))
+
+def compound_interest(principal: float, rate: float, periods: int) -> float:
+    """Compound interest"""
+    try:
+        return principal * ((1 + rate) ** periods - 1)
+    except OverflowError:
+        raise ValueError(f"compound_interest: overflow — rate must be decimal (e.g., 0.05 for 5%, not 5), got rate={rate}, periods={periods}")
+
+def correlation(x: List[float], y: List[float]) -> float:
+    """Pearson correlation coefficient"""
+    if len(x) != len(y) or not x:
+        return 0
+    mean_x = avg(x)
+    mean_y = avg(y)
+    numerator = sum((xi - mean_x) * (yi - mean_y) for xi, yi in zip(x, y))
+    denominator = math.sqrt(sum((xi - mean_x) ** 2 for xi in x) * sum((yi - mean_y) ** 2 for yi in y))
+    return numerator / denominator if denominator != 0 else 0
+
+def covariance(x: List[float], y: List[float]) -> float:
+    """Covariance between two lists"""
+    if len(x) != len(y) or not x:
+        return 0
+    mean_x = avg(x)
+    mean_y = avg(y)
+    return sum((xi - mean_x) * (yi - mean_y) for xi, yi in zip(x, y)) / len(x)
+
+def double_declining(cost: float, life: int) -> float:
+    """Double declining balance"""
+    life = _coerce_n_to_int(life, 'life')
+    if life == 0:
+        raise ValueError("double_declining: life must be greater than zero")
+    return cost * (2 / life)
+
+def ends_with(s: str, suffix: str) -> bool:
+    """Check if string ends with suffix"""
+    if s is None or suffix is None:
+        return False
+    return str(s).endswith(str(suffix))
+
+def from_bps(bps: float) -> float:
+    return bps / 10000
+
+def from_percentage(pct: float) -> float:
+    """Convert percentage to decimal"""
+    return pct / 100
+
+# Statistical
+
+def fx_convert(v: float, rate: float) -> float:
+    return v * rate
+
+def interest_on_balance(balance: float, rate: float, days: int) -> float:
+    """Interest using ACT/360"""
+    return balance * rate * (days / 360)
+
+def is_negative(x: float) -> bool:
+    """Check if negative"""
+    return x < 0
+
+# Logical
+
+def is_positive(x: float) -> bool:
+    """Check if positive"""
+    return x > 0
+
+def map_array(array: List[Any], var_name: str, expression: str, context: Dict[str, Any] = None) -> List[Any]:
+    """
+    Transform each element of an array using an expression.
+    Similar to for_each_with_index but focused on transformation.
+    
+    Args:
+        array: Array to transform
+        var_name: Variable name for current element
+        expression: Transformation expression
+        context: Optional dictionary of external variables (other arrays, totals, etc.)
+    
+    Returns:
+        Transformed array
+    
+    Example:
+        map_array(amounts_arr, "x", "x * 1.1")  # Apply 10% increase
+        map_array(dates_arr, "d", "add_days(d, 30)")  # Shift all dates
+        
+        # With context:
+        map_array(names, "n", "if(eq(n, 'Discount'), 0, array_get(values, index, 0))", {"values": [100, 200]})
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+
+    mapped = for_each_with_index(array, var_name, expression, context)
+    # Convert None results (evaluation errors) to a safe numeric default (0)
+    cleaned = []
+    for i, v in enumerate(mapped):
+        if v is None:
+            logger.debug(f"map_array: expression evaluation returned None at index {i} for var '{var_name}'")
+            cleaned.append(0)
+        else:
+            cleaned.append(v)
+    return cleaned
+
+def mod(a: float, b: float) -> float:
+    if b == 0:
+        raise ValueError("mod: divisor b cannot be zero")
+    return a % b
+
+def normalize(v: float, base: float) -> float:
+    return v / base if base != 0 else 0
+
+def percentage_of(value: float, pct: float) -> float:
+    """Calculate percentage"""
+    return value * pct
+
+def percentile(col: List[float], p: float) -> float:
+    """Calculate percentile"""
+    if not col:
+        return 0
+    sorted_col = sorted(col)
+    k = (len(sorted_col) - 1) * p
+    f = math.floor(k)
+    c = math.ceil(k)
+    if f == c:
+        return sorted_col[int(k)]
+    return sorted_col[int(f)] * (c - k) + sorted_col[int(c)] * (k - f)
+
+def prorate(value: float, part: float, total: float) -> float:
+    """Proportional allocation"""
+    return value * (part / total) if total > 0 else 0
+
+def ratio_split(value: float, ratios: List[float]) -> List[float]:
+    """Split by ratios"""
+    return allocate(value, ratios)
+
+# Balance Functions
+
+def reducing_balance(cost: float, rate: float) -> float:
+    """Declining balance"""
+    return cost * rate
+
+def rolling_balance(opening: float, flows: List[float]) -> float:
+    """Running balance"""
+    return opening + sum(flows)
+
+def split(value: float, n: int) -> float:
+    """Equal split"""
+    n = _coerce_n_to_int(n, 'n')
+    return value / n if n > 0 else 0
+
+def sqrt(x: float) -> float:
+    if x < 0:
+        raise ValueError(f"sqrt: input must be >= 0, got {x}")
+    return math.sqrt(x)
+
+def starts_with(s: str, prefix: str) -> bool:
+    """Check if string starts with prefix"""
+    if s is None or prefix is None:
+        return False
+    return str(s).startswith(str(prefix))
+
+def straight_line(cost: float, salvage: float, life: int) -> float:
+    """Straight-line depreciation"""
+    life = _coerce_n_to_int(life, 'life')
+    if life == 0:
+        raise ValueError("straight_line: life must be greater than zero")
+    return (cost - salvage) / life
+
+def sum_of_years(cost: float, salvage: float, life: int, year: int) -> float:
+    """Sum of years digits"""
+    total_years = sum(range(1, life + 1))
+    if total_years == 0:
+        return 0
+    return ((cost - salvage) * (life - year + 1)) / total_years
+
+def to_percentage(decimal: float) -> float:
+    """Convert decimal to percentage"""
+    return decimal * 100
+
+def units_of_production(cost: float, units: float, total: float) -> float:
+    """Usage-based depreciation"""
+    return cost * (units / total) if total > 0 else 0
+
+# Allocation
+
+def variance(col: List[float]) -> float:
+    if not col:
+        return 0
+    mu = avg(col)
+    return sum((x - mu) ** 2 for x in col) / len(col)
+
+def weighted_balance(balances: List[float], days: List[int]) -> float:
+    """Weighted average balance"""
+    if not balances or not days or len(balances) != len(days):
+        return 0
+    total_days = sum(days)
+    return sum(b * d for b, d in zip(balances, days)) / total_days if total_days > 0 else 0
+
+# Arithmetic
+
+def xor(a: bool, b: bool) -> bool:
+    return a != b
+
+def zip_arrays(*arrays) -> List[List[Any]]:
+    """
+    Combine multiple arrays into array of tuples/lists.
+    Useful for parallel iteration.
+    
+    Args:
+        *arrays: Variable number of arrays to zip
+    
+    Returns:
+        List of lists, where each inner list contains elements at same index
+    
+    Example:
+        zip_arrays(dates_arr, amounts_arr, types_arr)
+        -> [["2024-01-15", 1000, "CF"], ["2024-02-15", 1000, "CF"], ...]
+    """
+    if not arrays:
+        return []
+    
+    min_len = min(len(arr) for arr in arrays if arr)
+    result = []
+    
+    for i in range(min_len):
+        row = [arr[i] if arr and i < len(arr) else None for arr in arrays]
+        result.append(row)
+    
+    return result
+
+def zscore(value: float, mean_val: float, std: float) -> float:
+    """Z-score"""
+    return (value - mean_val) / std if std != 0 else 0
+
+
+# ============= Transaction Functions =============
+
+# Global list to store transactions created by createTransaction
+# ---------------------------------------------------------------------------
+# Thread-safe accessors for per-thread mutable state.
+# These replace the former module-level globals.  Each thread gets its own
+# isolated copy via _tls (threading.local) defined at the top of the file.
+# ---------------------------------------------------------------------------
+
+
 DSL_FUNCTIONS = {
     'lookup': lookup,
     'normalize_arraydate': normalize_arraydate,
@@ -3117,44 +3782,26 @@ DSL_FUNCTIONS = {
     'xnpv': xnpv, 'xirr': xirr,
     'discount_factor': discount_factor, 'accumulation_factor': accumulation_factor,
     'effective_rate': effective_rate, 'nominal_rate': nominal_rate, 'yield_to_maturity': yield_to_maturity,
-    'compound_interest': compound_interest,
-    'interest_on_balance': interest_on_balance,
-    'capitalization': capitalization, 'amortized_cost': amortized_cost,
-    
-    # Depreciation
-    'straight_line': straight_line, 'reducing_balance': reducing_balance,
-    'double_declining': double_declining, 'sum_of_years': sum_of_years,
-    'units_of_production': units_of_production,
-    
-    # Allocation
-    'prorate': prorate, 'allocate': allocate, 'split': split,
-    'percentage_of': percentage_of, 'ratio_split': ratio_split,
-    
-    # Balance
-    'rolling_balance': rolling_balance,
-    'average_balance': average_balance, 'weighted_balance': weighted_balance,
-    
+
     # Arithmetic
     'add': add, 'subtract': subtract, 'multiply': multiply, 'divide': divide,
-    'power': power, 'sqrt': sqrt, 'abs': abs_val, 'sign': sign,
-    'round': round_val, 'floor': floor, 'ceil': ceil, 'mod': mod,
-    'truncate': truncate, 'percentage': percentage, 'change_pct': change_pct,
+    'power': power, 'abs': abs_val, 'sign': sign,
+    'round': round_val, 'floor': floor, 'ceil': ceil,
+    'truncate': truncate, 'percentage': percentage,
     # Operator wrappers (explicit secure operators)
     'op_eq': op_eq, 'op_neq': op_neq, 'op_gt': op_gt, 'op_gte': op_gte, 'op_lt': op_lt, 'op_lte': op_lte,
     'op_add': op_add, 'op_sub': op_sub, 'op_mul': op_mul, 'op_div': op_div,
-    
+
     # Comparison
     'eq': eq, 'neq': neq, 'gt': gt, 'gte': gte, 'lt': lt, 'lte': lte,
     'between': between, 'is_null': is_null,
-    'is_positive': is_positive, 'is_negative': is_negative,
-    
+
     # Logical
-    'and': and_op, 'or': or_op, 'not': not_op, 'xor': xor,
+    'and': and_op, 'or': or_op, 'not': not_op,
     'all': all_op, 'any': any_op, 'if': if_op, 'iif': if_op,
-    'coalesce': coalesce, 'clamp': clamp, 'switch': switch,
-    
+    'coalesce': coalesce, 'switch': switch,
+
     # Date
-    'normalize_date': normalize_date,
     'days_between': days_between, 'months_between': months_between, 'years_between': years_between,
     'add_days': add_days, 'add_months': add_months, 'add_years': add_years,
     'subtract_days': subtract_days, 'subtract_months': subtract_months, 'subtract_years': subtract_years,
@@ -3162,43 +3809,32 @@ DSL_FUNCTIONS = {
     'day_count_fraction': day_count_fraction, 'is_leap_year': is_leap_year,
     'days_in_year': days_in_year, 'quarter': quarter, 'day_of_week': day_of_week,
     'is_weekend': is_weekend, 'business_days': business_days,
-    
+
     # Schedule Functions
     'period': period, 'schedule': schedule,
     'schedule_sum': schedule_sum,
     'schedule_last': schedule_last, 'schedule_first': schedule_first,
     'schedule_column': schedule_column,
     'schedule_filter': schedule_filter,
-    
-    # Generic Multi-Item Schedule Generation (internal implementations retained, not exposed)
-    
+
     # Aggregation
     'sum': sum_vals, 'sum_field': sum_field, 'avg': avg, 'min': min_val, 'max': max_val, 'count': count,
     'weighted_avg': weighted_avg, 'cumulative_sum': cumulative_sum,
-    'median': median, 'variance': variance, 'std_dev': std_dev,
-    'percentile': percentile, 'range': range_val,
-    
-    # Conversion
-    'fx_convert': fx_convert, 'normalize': normalize,
-    'basis_points': basis_points, 'from_bps': from_bps,
-    'to_percentage': to_percentage, 'from_percentage': from_percentage,
-    
-    # Statistical
-    'correlation': correlation, 'covariance': covariance, 'zscore': zscore,
-    
+    'median': median, 'std_dev': std_dev,
+
     # String Functions
     'lower': lower, 'upper': upper, 'concat': concat, 'contains': contains,
-    'eq_ignore_case': eq_ignore_case, 'starts_with': starts_with, 'ends_with': ends_with,
+    'eq_ignore_case': eq_ignore_case,
     'trim': trim, 'str_length': str_length,
-    
+
     # Transaction
     'createTransaction': createTransaction,
     # Safe print wrapper
     'print': dsl_print,
-    
+
     # Iteration & Array Operations
     'for_each': for_each, 'for_each_with_index': for_each_with_index,
-    'map_array': map_array, 'zip_arrays': zip_arrays,
+    'apply_each': apply_each,
     'array_length': array_length, 'array_get': array_get,
     'array_first': array_first, 'array_last': array_last,
     'array_slice': array_slice, 'array_reverse': array_reverse,
@@ -3206,7 +3842,7 @@ DSL_FUNCTIONS = {
     'array_filter': array_filter,
 }
 
-# Function metadata for UI display (145 functions)
+# Function metadata for UI display (104 functions)
 DSL_FUNCTION_METADATA = [
     {"name": "lookup", "params": "value_array, match_array, target_value", "description": "Search a list for a matching value and return the corresponding item from a second list. Returns null if no match is found.", "category": "Array Utilities"},
     {"name": "normalize_arraydate", "params": "array", "description": "Convert a list of dates written in various formats into the standard YYYY-MM-DD format.", "category": "Date"},
@@ -3226,29 +3862,12 @@ DSL_FUNCTION_METADATA = [
     {"name": "effective_rate", "params": "nominal, freq", "description": "Convert a nominal interest rate to its effective annual rate, accounting for the number of compounding periods per year.", "category": "Financial"},
     {"name": "nominal_rate", "params": "effective, freq", "description": "Convert an effective annual interest rate back to its nominal rate for a given number of compounding periods per year.", "category": "Financial"},
     {"name": "yield_to_maturity", "params": "price, face, coupon, years", "description": "Calculate the approximate yield to maturity of a bond based on its market price, face value, annual coupon rate, and remaining years to maturity.", "category": "Financial"},
-    {"name": "compound_interest", "params": "principal, rate, periods", "description": "Calculate the total interest earned when a principal is compounded over a number of periods at a given rate. The rate is entered as a decimal.", "category": "Financial"},
-    {"name": "interest_on_balance", "params": "balance, rate, days", "description": "Calculate the interest accrued on a balance for a given number of days using an annual rate under the ACT/360 day count convention.", "category": "Financial"},
-    {"name": "capitalization", "params": "interest, balance", "description": "Add accrued interest to an existing balance to produce the new outstanding principal balance.", "category": "Financial"},
-    {"name": "amortized_cost", "params": "opening, interest, payment", "description": "Calculate the closing balance of a financial instrument after applying the period interest and deducting the payment from the opening balance.", "category": "Financial"},
 
     # Depreciation (5)
-    {"name": "straight_line", "params": "cost, salvage, life", "description": "Calculate the annual depreciation charge by spreading the depreciable cost evenly over the useful life of an asset.", "category": "Depreciation"},
-    {"name": "reducing_balance", "params": "cost, rate", "description": "Calculate the depreciation charge for the period by applying a fixed percentage rate to the current book value of the asset.", "category": "Depreciation"},
-    {"name": "double_declining", "params": "cost, life", "description": "Calculate the depreciation charge using double the straight-line rate applied to the current book value, front-loading higher charges in early years.", "category": "Depreciation"},
-    {"name": "sum_of_years", "params": "cost, salvage, life, year", "description": "Calculate the depreciation charge for a specific year using the sum-of-years-digits method, which assigns higher charges to earlier years.", "category": "Depreciation"},
-    {"name": "units_of_production", "params": "cost, units, total", "description": "Calculate the depreciation charge based on actual usage in the period, such as units produced or hours of operation.", "category": "Depreciation"},
 
     # Allocation (5)
-    {"name": "prorate", "params": "value, part, total", "description": "Allocate a portion of a value in proportion to a partial period or partial quantity relative to a defined total.", "category": "Allocation"},
-    {"name": "allocate", "params": "value, weights", "description": "Distribute a total value across multiple recipients according to a list of weights, returning the allocated amount for each.", "category": "Allocation"},
-    {"name": "split", "params": "value, n", "description": "Divide a value into a specified number of equal portions.", "category": "Allocation"},
-    {"name": "percentage_of", "params": "value, pct", "description": "Calculate the monetary amount that corresponds to a given percentage of a value.", "category": "Allocation"},
-    {"name": "ratio_split", "params": "value, ratios", "description": "Split a total amount across multiple recipients according to a list of ratios.", "category": "Allocation"},
 
     # Balance (3)
-    {"name": "rolling_balance", "params": "opening, flows", "description": "Calculate the running balance by applying a series of inflows and outflows to an opening balance.", "category": "Balance"},
-    {"name": "average_balance", "params": "balances", "description": "Calculate the simple arithmetic average of a list of balance amounts.", "category": "Balance"},
-    {"name": "weighted_balance", "params": "balances, days", "description": "Calculate the average balance weighted by the number of days each balance was held during the period.", "category": "Balance"},
 
     # Arithmetic (15)
     {"name": "add", "params": "a, b", "description": "Add two numbers together.", "category": "Arithmetic"},
@@ -3256,16 +3875,13 @@ DSL_FUNCTION_METADATA = [
     {"name": "multiply", "params": "a, b", "description": "Multiply two numbers together.", "category": "Arithmetic"},
     {"name": "divide", "params": "a, b", "description": "Divide the first number by the second.", "category": "Arithmetic"},
     {"name": "power", "params": "a, b", "description": "Raise a number to the power of a given exponent.", "category": "Arithmetic"},
-    {"name": "sqrt", "params": "x", "description": "Calculate the square root of a non-negative number.", "category": "Arithmetic"},
     {"name": "abs", "params": "x", "description": "Return the absolute value of a number, removing any negative sign.", "category": "Arithmetic"},
     {"name": "sign", "params": "x", "description": "Return -1 if the number is negative, 0 if zero, or 1 if positive.", "category": "Arithmetic"},
     {"name": "round", "params": "x, n=0", "description": "Round a number to a specified number of decimal places.", "category": "Arithmetic"},
     {"name": "floor", "params": "x", "description": "Round a number down to the nearest whole number.", "category": "Arithmetic"},
     {"name": "ceil", "params": "x", "description": "Round a number up to the nearest whole number.", "category": "Arithmetic"},
-    {"name": "mod", "params": "a, b", "description": "Return the remainder left over after dividing one number by another.", "category": "Arithmetic"},
     {"name": "truncate", "params": "x, decimals=0", "description": "Remove decimal places beyond a specified number of positions without any rounding.", "category": "Arithmetic"},
     {"name": "percentage", "params": "value, total", "description": "Calculate what percentage one number represents of a given total.", "category": "Arithmetic"},
-    {"name": "change_pct", "params": "old, new", "description": "Calculate the percentage change between an old value and a new value.", "category": "Arithmetic"},
 
     # Comparison (10)
     {"name": "eq", "params": "a, b", "description": "Check whether two values are equal.", "category": "Comparison"},
@@ -3276,19 +3892,15 @@ DSL_FUNCTION_METADATA = [
     {"name": "lte", "params": "a, b", "description": "Check whether the first value is less than or equal to the second.", "category": "Comparison"},
     {"name": "between", "params": "x, l, u", "description": "Check whether a value falls within a specified lower and upper boundary, inclusive.", "category": "Comparison"},
     {"name": "is_null", "params": "x", "description": "Check whether a value is empty or missing.", "category": "Comparison"},
-    {"name": "is_positive", "params": "x", "description": "Check whether a number is greater than zero.", "category": "Comparison"},
-    {"name": "is_negative", "params": "x", "description": "Check whether a number is less than zero.", "category": "Comparison"},
 
     # Logical (10)
     {"name": "and", "params": "a, b", "description": "Return true only if both conditions are true.", "category": "Logical"},
     {"name": "or", "params": "a, b", "description": "Return true if at least one of the two conditions is true.", "category": "Logical"},
     {"name": "not", "params": "a", "description": "Reverse a condition — returns true if the condition is false, and false if it is true.", "category": "Logical"},
-    {"name": "xor", "params": "a, b", "description": "Return true if exactly one of the two conditions is true, but not both.", "category": "Logical"},
     {"name": "all", "params": "list", "description": "Return true only if every item in a list evaluates to true.", "category": "Logical"},
     {"name": "any", "params": "list", "description": "Return true if at least one item in a list evaluates to true.", "category": "Logical"},
-    {"name": "iif", "params": "cond, true_val, false_val", "description": "Return one of two values based on a condition — works like an IF statement in a spreadsheet.", "category": "Logical"},
+    {"name": "if", "params": "cond, true_val, false_val", "description": "Return one of two values based on a condition — works like an IF statement in a spreadsheet.", "category": "Logical"},
     {"name": "coalesce", "params": "*args", "description": "Return the first non-empty value from a list — useful for providing a fallback default when a value may be missing.", "category": "Logical"},
-    {"name": "clamp", "params": "x, min, max", "description": "Restrict a value so it falls within a specified minimum and maximum range.", "category": "Logical"},
     {"name": "switch", "params": "value, cases, default", "description": "Look up a value against a set of named cases and return the matching result, or a default value if no match is found.", "category": "Logical"},
 
     # Date (19)
@@ -3314,7 +3926,7 @@ DSL_FUNCTION_METADATA = [
 
     # Schedule (7)
     {"name": "schedule", "params": "period, columns", "description": "Generate a time-based schedule table with calculated columns, suitable for amortisation, accrual, revenue, or depreciation schedules.", "category": "Schedule"},
-    {"name": "period", "params": "start, end, freq, conv?", "description": "Define a time period with a start date, end date, frequency (monthly, quarterly, annual, etc.), and an optional day count convention.", "category": "Schedule"},
+    {"name": "period", "params": "start, end?, freq?, conv?", "description": "Define a time period. Two forms: (1) period(start_date, end_date, freq, conv?) with explicit YYYY-MM-DD dates; (2) period(N) or period(N, freq) — count form: emit N period dates starting from the current posting date, advancing by freq (default M). freq: M=monthly, Q=quarterly, A=annual, W=weekly, D=daily.", "category": "Schedule"},
     {"name": "schedule_sum", "params": "schedule, column", "description": "Add up all values in a specified column of a generated schedule.", "category": "Schedule"},
     {"name": "schedule_last", "params": "schedule, column", "description": "Retrieve the value from the last row of a specified column in a schedule.", "category": "Schedule"},
     {"name": "schedule_first", "params": "schedule, column", "description": "Retrieve the value from the first row of a specified column in a schedule.", "category": "Schedule"},
@@ -3331,23 +3943,11 @@ DSL_FUNCTION_METADATA = [
     {"name": "weighted_avg", "params": "v, w", "description": "Calculate the average of a list of values, where each value is weighted by a corresponding weight factor.", "category": "Aggregation"},
     {"name": "cumulative_sum", "params": "col", "description": "Calculate the running total of a list, returning a new list where each entry is the accumulated sum up to that point.", "category": "Aggregation"},
     {"name": "median", "params": "col", "description": "Return the middle value of a sorted list — half the values fall above and half fall below.", "category": "Aggregation"},
-    {"name": "variance", "params": "col", "description": "Measure how spread out the values in a list are by calculating the average of squared differences from the mean.", "category": "Aggregation"},
     {"name": "std_dev", "params": "col", "description": "Measure how spread out the values in a list are around the average, expressed on the same scale as the values.", "category": "Aggregation"},
-    {"name": "percentile", "params": "col, p", "description": "Return the value below which a given share of values in the list fall. Supply p as a decimal between 0 and 1.", "category": "Aggregation"},
-    {"name": "range", "params": "col", "description": "Return the difference between the largest and smallest values in a list.", "category": "Aggregation"},
 
     # Conversion (6)
-    {"name": "fx_convert", "params": "v, rate", "description": "Convert an amount from one currency to another using a given exchange rate.", "category": "Conversion"},
-    {"name": "normalize", "params": "v, base", "description": "Scale a value relative to a base amount, expressing it as a proportion of that base.", "category": "Conversion"},
-    {"name": "basis_points", "params": "rate", "description": "Convert a decimal interest rate to basis points, where one percent equals 100 basis points.", "category": "Conversion"},
-    {"name": "from_bps", "params": "bps", "description": "Convert a basis point value back to its decimal interest rate equivalent.", "category": "Conversion"},
-    {"name": "to_percentage", "params": "decimal", "description": "Convert a decimal value to a percentage by multiplying by 100.", "category": "Conversion"},
-    {"name": "from_percentage", "params": "pct", "description": "Convert a percentage value back to its decimal equivalent by dividing by 100.", "category": "Conversion"},
 
     # Statistical (3)
-    {"name": "correlation", "params": "x, y", "description": "Measure the linear relationship between two sets of values, returning a result between -1 (inverse) and 1 (perfect match).", "category": "Statistical"},
-    {"name": "covariance", "params": "x, y", "description": "Measure how two sets of values move together — a positive result means they tend to increase and decrease together.", "category": "Statistical"},
-    {"name": "zscore", "params": "value, mean, std", "description": "Calculate how many standard deviations a single value sits above or below the mean of a distribution.", "category": "Statistical"},
 
     # String (9)
     {"name": "lower", "params": "s", "description": "Convert all characters in a text value to lowercase.", "category": "String"},
@@ -3355,27 +3955,22 @@ DSL_FUNCTION_METADATA = [
     {"name": "concat", "params": "s1, s2, ...", "description": "Join two or more text values together into a single combined string.", "category": "String"},
     {"name": "contains", "params": "s, substring", "description": "Check whether a piece of text contains a specific word or phrase.", "category": "String"},
     {"name": "eq_ignore_case", "params": "a, b", "description": "Check whether two text values are equal, ignoring any differences in upper or lower case.", "category": "String"},
-    {"name": "starts_with", "params": "s, prefix", "description": "Check whether a text value begins with a specified word or prefix.", "category": "String"},
-    {"name": "ends_with", "params": "s, suffix", "description": "Check whether a text value ends with a specified word or suffix.", "category": "String"},
     {"name": "trim", "params": "s", "description": "Remove any extra spaces from the beginning and end of a text value.", "category": "String"},
     {"name": "str_length", "params": "s", "description": "Return the number of characters in a text value.", "category": "String"},
 
     # Array Collection (6)
-    {"name": "collect", "params": "EVENT.field", "description": "Gather all values of an event field for the current instrument and posting date into a list, for use in calculations such as NPV or IRR.", "category": "Array"},
     {"name": "collect_by_instrument", "params": "EVENT.field", "description": "Gather all values of an event field for the current instrument across all dates into a single list.", "category": "Array"},
     {"name": "collect_all", "params": "EVENT.field", "description": "Gather every value of an event field across all rows in the dataset without any filtering.", "category": "Array"},
     {"name": "collect_by_subinstrument", "params": "EVENT.field", "description": "Gather all values of an event field for a specific instrument and sub-instrument combination.", "category": "Array"},
-    {"name": "collect_subinstrumentids", "params": "", "description": "Return a list of all unique sub-instrument IDs associated with the current instrument.", "category": "Array"},
     {"name": "collect_effectivedates_for_subinstrument", "params": "subinstrument_id?", "description": "Return a list of all effective dates associated with a specified sub-instrument.", "category": "Array"},
 
-    # Iteration (4)
+    # Iteration (5)
+    {"name": "apply_each", "params": "array, expression", "description": "Apply a formula to every item in a list using 'each' as the current item, and return the results. For paired lists, pass two arrays and use 'first' and 'second' in the formula.", "category": "Iteration"},
     {"name": "for_each", "params": "dates_arr, amounts_arr, date_var, amt_var, expr", "description": "Loop through two paired lists of dates and amounts, running a specified action for each pair — commonly used to create multiple transactions.", "category": "Iteration"},
     {"name": "for_each_with_index", "params": "array, var_name, expression, context?", "description": "Loop through a list, making each item and its position number available inside the loop body.", "category": "Iteration"},
-    {"name": "map_array", "params": "array, var_name, expression, context?", "description": "Apply a calculation to every item in a list and return the transformed results as a new list.", "category": "Iteration"},
     {"name": "array_filter", "params": "array, var_name, condition, context?", "description": "Return a new list containing only the items from the original list that meet a specified condition.", "category": "Iteration"},
 
     # Array Utilities (9)
-    {"name": "zip_arrays", "params": "*arrays", "description": "Combine two or more lists element-by-element, pairing items at matching positions for use in parallel processing.", "category": "Array Utilities"},
     {"name": "array_length", "params": "array", "description": "Return the number of items in a list.", "category": "Array Utilities"},
     {"name": "array_get", "params": "array, index, default=None", "description": "Return the item at a specified position in a list, with a fallback value if the position is beyond the end of the list.", "category": "Array Utilities"},
     {"name": "array_first", "params": "array, default=None", "description": "Return the first item in a list, with an optional fallback value if the list is empty.", "category": "Array Utilities"},
@@ -3387,6 +3982,50 @@ DSL_FUNCTION_METADATA = [
 
     # Transaction (1)
     {"name": "createTransaction", "params": "postingdate, effectivedate, transactiontype, amount, subinstrumentid='1'", "description": "Record a financial transaction with a posting date, effective date, transaction type, and amount. The sub-instrument ID defaults to '1' if not provided.", "category": "Transaction"},
+
+    # Additional utility functions
+    {"name": "compound_interest", "params": "principal, rate, periods", "description": "Calculate the total interest earned when a principal is compounded over a number of periods at a given rate. The rate is entered as a decimal.", "category": "Financial"},
+    {"name": "interest_on_balance", "params": "balance, rate, days", "description": "Calculate the interest accrued on a balance for a given number of days using an annual rate under the ACT/360 day count convention.", "category": "Financial"},
+    {"name": "capitalization", "params": "interest, balance", "description": "Add accrued interest to an existing balance to produce the new outstanding principal balance.", "category": "Financial"},
+    {"name": "amortized_cost", "params": "opening, interest, payment", "description": "Calculate the closing balance of a financial instrument after applying the period interest and deducting the payment from the opening balance.", "category": "Financial"},
+    {"name": "straight_line", "params": "cost, salvage, life", "description": "Calculate the annual depreciation charge by spreading the depreciable cost evenly over the useful life of an asset.", "category": "Depreciation"},
+    {"name": "reducing_balance", "params": "cost, rate", "description": "Calculate the depreciation charge for the period by applying a fixed percentage rate to the current book value of the asset.", "category": "Depreciation"},
+    {"name": "double_declining", "params": "cost, life", "description": "Calculate the depreciation charge using double the straight-line rate applied to the current book value, front-loading higher charges in early years.", "category": "Depreciation"},
+    {"name": "sum_of_years", "params": "cost, salvage, life, year", "description": "Calculate the depreciation charge for a specific year using the sum-of-years-digits method, which assigns higher charges to earlier years.", "category": "Depreciation"},
+    {"name": "units_of_production", "params": "cost, units, total", "description": "Calculate the depreciation charge based on actual usage in the period, such as units produced or hours of operation.", "category": "Depreciation"},
+    {"name": "prorate", "params": "value, part, total", "description": "Allocate a portion of a value in proportion to a partial period or partial quantity relative to a defined total.", "category": "Allocation"},
+    {"name": "allocate", "params": "value, weights", "description": "Distribute a total value across multiple recipients according to a list of weights, returning the allocated amount for each.", "category": "Allocation"},
+    {"name": "split", "params": "value, n", "description": "Divide a value into a specified number of equal portions.", "category": "Allocation"},
+    {"name": "percentage_of", "params": "value, pct", "description": "Calculate the monetary amount that corresponds to a given percentage of a value.", "category": "Allocation"},
+    {"name": "ratio_split", "params": "value, ratios", "description": "Split a total amount across multiple recipients according to a list of ratios.", "category": "Allocation"},
+    {"name": "rolling_balance", "params": "opening, flows", "description": "Calculate the running balance by applying a series of inflows and outflows to an opening balance.", "category": "Balance"},
+    {"name": "average_balance", "params": "balances", "description": "Calculate the simple arithmetic average of a list of balance amounts.", "category": "Balance"},
+    {"name": "weighted_balance", "params": "balances, days", "description": "Calculate the average balance weighted by the number of days each balance was held during the period.", "category": "Balance"},
+    {"name": "sqrt", "params": "x", "description": "Calculate the square root of a non-negative number.", "category": "Arithmetic"},
+    {"name": "mod", "params": "a, b", "description": "Return the remainder left over after dividing one number by another.", "category": "Arithmetic"},
+    {"name": "change_pct", "params": "old, new", "description": "Calculate the percentage change between an old value and a new value.", "category": "Arithmetic"},
+    {"name": "is_positive", "params": "x", "description": "Check whether a number is greater than zero.", "category": "Comparison"},
+    {"name": "is_negative", "params": "x", "description": "Check whether a number is less than zero.", "category": "Comparison"},
+    {"name": "xor", "params": "a, b", "description": "Return true if exactly one of the two conditions is true, but not both.", "category": "Logical"},
+    {"name": "clamp", "params": "x, min, max", "description": "Restrict a value so it falls within a specified minimum and maximum range.", "category": "Logical"},
+    {"name": "variance", "params": "col", "description": "Measure how spread out the values in a list are by calculating the average of squared differences from the mean.", "category": "Aggregation"},
+    {"name": "percentile", "params": "col, p", "description": "Return the value below which a given share of values in the list fall. Supply p as a decimal between 0 and 1.", "category": "Aggregation"},
+    {"name": "range", "params": "col", "description": "Return the difference between the largest and smallest values in a list.", "category": "Aggregation"},
+    {"name": "fx_convert", "params": "v, rate", "description": "Convert an amount from one currency to another using a given exchange rate.", "category": "Conversion"},
+    {"name": "normalize", "params": "v, base", "description": "Scale a value relative to a base amount, expressing it as a proportion of that base.", "category": "Conversion"},
+    {"name": "basis_points", "params": "rate", "description": "Convert a decimal interest rate to basis points, where one percent equals 100 basis points.", "category": "Conversion"},
+    {"name": "from_bps", "params": "bps", "description": "Convert a basis point value back to its decimal interest rate equivalent.", "category": "Conversion"},
+    {"name": "to_percentage", "params": "decimal", "description": "Convert a decimal value to a percentage by multiplying by 100.", "category": "Conversion"},
+    {"name": "from_percentage", "params": "pct", "description": "Convert a percentage value back to its decimal equivalent by dividing by 100.", "category": "Conversion"},
+    {"name": "correlation", "params": "x, y", "description": "Measure the linear relationship between two sets of values, returning a result between -1 (inverse) and 1 (perfect match).", "category": "Statistical"},
+    {"name": "covariance", "params": "x, y", "description": "Measure how two sets of values move together — a positive result means they tend to increase and decrease together.", "category": "Statistical"},
+    {"name": "zscore", "params": "value, mean, std", "description": "Calculate how many standard deviations a single value sits above or below the mean of a distribution.", "category": "Statistical"},
+    {"name": "starts_with", "params": "s, prefix", "description": "Check whether a text value begins with a specified word or prefix.", "category": "String"},
+    {"name": "ends_with", "params": "s, suffix", "description": "Check whether a text value ends with a specified word or suffix.", "category": "String"},
+    {"name": "collect_subinstrumentids", "params": "", "description": "Return a list of all unique sub-instrument IDs associated with the current instrument.", "category": "Array"},
+    {"name": "map_array", "params": "array, var_name, expression, context?", "description": "Apply a calculation to every item in a list and return the transformed results as a new list.", "category": "Iteration"},
+    {"name": "zip_arrays", "params": "*arrays", "description": "Combine two or more lists element-by-element, pairing items at matching positions for use in parallel processing.", "category": "Array Utilities"},
+
 ]
 
 print(f"Loaded {len(DSL_FUNCTIONS)} functions across {len(set(f['category'] for f in DSL_FUNCTION_METADATA))} categories")

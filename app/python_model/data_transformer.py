@@ -86,7 +86,10 @@ def _is_custom_event(records: list, event_id: str) -> bool:
 
 
 def _infer_field_datatype(values: list) -> str:
-    """Infer the best datatype for a field from a list of sample values."""
+    """Infer the best datatype for a field from a list of sample values.
+    Scans all non-null values; the first conclusive type wins (boolean > date > string > decimal).
+    Numeric strings (e.g. "1250.50", "42") are treated as decimal.
+    """
     for v in values:
         if v is None:
             continue
@@ -97,8 +100,12 @@ def _infer_field_datatype(values: list) -> str:
         if isinstance(v, str):
             if re.match(r"^\d{4}-\d{2}-\d{2}", v):
                 return "date"
+            # Check if the string is a numeric value (handles "1250.50", "-42", "1,234.56")
+            stripped = v.strip().lstrip('-').replace(',', '')
+            if stripped.replace('.', '', 1).isdigit():
+                return "decimal"
             return "string"
-        if isinstance(v, float) and v != int(v):
+        if isinstance(v, (int, float)):
             return "decimal"
     return "decimal"
 
@@ -112,6 +119,46 @@ def get_field_case_insensitive(row: Dict[str, Any], field_name: str, default: An
         if key.lower() == field_lower:
             return row[key]
     return default
+
+
+def _sort_activity_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Enforce canonical activity-data ordering:
+        instrumentid ASC, postingdate ASC, effectivedate ASC, subinstrumentid ASC
+
+    Mirrors backend/server.py::_sort_activity_rows so the export runtime
+    delivers activity rows to the generated template in the same canonical
+    order as the playground. Reference / custom event data is intentionally
+    skipped by the caller — it has no instrument/date axis.
+    """
+    if not isinstance(rows, list) or len(rows) <= 1:
+        return rows
+
+    def _ci(row, name):
+        if not isinstance(row, dict):
+            return ''
+        if name in row:
+            v = row[name]
+        else:
+            lname = name.lower()
+            v = ''
+            for k, val in row.items():
+                if str(k).lower() == lname:
+                    v = val
+                    break
+        if v is None:
+            return ''
+        return str(v)
+
+    try:
+        rows.sort(key=lambda r: (
+            _ci(r, 'instrumentid'),
+            _ci(r, 'postingdate'),
+            _ci(r, 'effectivedate'),
+            _ci(r, 'subinstrumentid') or '1',
+        ))
+    except Exception:
+        pass
+    return rows
 
 
 # ---------------------------------------------------------------------------
@@ -216,6 +263,13 @@ def build_event_data_from_import(
                     row[key] = value
 
             event_rows[event_id].append(row)
+
+    # Activity-data only: enforce canonical sort
+    # (instrumentid ASC, postingdate ASC, effectivedate ASC, subinstrumentid ASC)
+    # for every non-custom event. Custom/reference events are left untouched.
+    for _eid, _rows in event_rows.items():
+        if _eid not in custom_events:
+            _sort_activity_rows(_rows)
 
     return [
         {"event_name": eid, "data_rows": rows}
@@ -335,15 +389,34 @@ def merge_event_data_by_instrument(event_data_dict: Dict[str, List[Dict]]) -> Li
 def filter_event_data_by_posting_date(
     event_data_dict: Dict[str, List[Dict]],
     posting_date: str,
+    event_metadata: Optional[Dict[str, Dict]] = None,
 ) -> Dict[str, List[Dict]]:
-    """Filter each event's rows to only those matching the given posting_date."""
+    """Filter each event's rows to only those matching the given posting_date.
+
+    Reference events (e.g. CATALOG) have no postingdate column — filtering
+    them by date would discard every row and break collect_all() lookups in
+    the generated template. When ``event_metadata`` says an event's
+    ``eventType`` is ``'reference'``, its rows are passed through unchanged.
+    Activity events are scoped to ``posting_date`` and re-sorted in the
+    canonical activity-data order so that collect_by_instrument() /
+    collect_all() and similar primitives iterate rows deterministically.
+    """
     target = posting_date.strip()
     filtered: Dict[str, List[Dict]] = {}
     for event_name, rows in event_data_dict.items():
-        filtered[event_name] = [
-            row for row in rows
-            if str(get_field_case_insensitive(row, "postingdate", "")).strip() == target
+        safe_rows = rows if isinstance(rows, list) else []
+        meta = (event_metadata or {}).get(event_name) or {}
+        if str(meta.get("eventType", "activity")).lower() == "reference":
+            # Reference tables have no postingdate — keep all rows untouched.
+            filtered[event_name] = list(safe_rows)
+            continue
+        scoped = [
+            row for row in safe_rows
+            if isinstance(row, dict)
+            and str(get_field_case_insensitive(row, "postingdate", "")).strip() == target
         ]
+        _sort_activity_rows(scoped)
+        filtered[event_name] = scoped
     return filtered
 
 
@@ -401,11 +474,23 @@ def transform(
     for ed in event_data_list:
         all_event_data[ed["event_name"]] = ed["data_rows"]
 
-    # raw_event_data includes everything (activity + reference) for collect() functions
-    raw_event_data = all_event_data
+    # Build per-event metadata so the posting-date filter can recognise reference
+    # tables (CATALOG-style) and pass them through without dropping every row.
+    definitions = build_event_definitions_from_import(records, allowed_instruments=None)
+    event_metadata: Dict[str, Dict] = {
+        d["event_name"]: {"eventType": d.get("eventType", "activity")}
+        for d in definitions
+    }
+
+    # raw_event_data is restricted to the requested posting date so that
+    # collect_by_instrument() / collect_all() — which otherwise span every date
+    # in the dataset — only see rows for the posting date being processed.
+    # collect() already filters by date and is unaffected. Reference events
+    # are passed through unchanged (they have no postingdate).
+    scoped = filter_event_data_by_posting_date(all_event_data, posting_date, event_metadata)
+    raw_event_data = scoped
 
     # Merge all events by instrument, scoped to the given posting date
-    scoped = filter_event_data_by_posting_date(all_event_data, posting_date)
     merged_data = merge_event_data_by_instrument(scoped)
 
     if not merged_data:

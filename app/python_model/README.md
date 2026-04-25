@@ -1,4 +1,8 @@
-# FyntracPythonModel — Model Runner for Main Repo
+# app.python_model — Optional Export Runtime
+
+This package is intended for running exported/generated models outside the main DSL Studio backend.
+
+In this repository, the primary application runtime is the FastAPI service in `backend/` started by `startup.sh`. This package is a secondary integration target, not the default server runtime.
 
 This folder contains everything the main Fyntrac app needs to run
 calculation models that were built and tested in the DSL Studio playground.
@@ -20,13 +24,13 @@ calculation models that were built and tested in the DSL Studio playground.
 
 ### Step 1: Copy this folder into your main repo
 
-Take the entire `FyntracPythonModel/` folder and place it inside your main
+Take the entire `app.python_model/` folder and place it inside your main
 Fyntrac repository, wherever your Python code lives. For example:
 
 ```
 your-main-repo/
     src/
-        FyntracPythonModel/
+        app.python_model/
             __init__.py
             dsl_functions.py
             data_transformer.py
@@ -35,7 +39,7 @@ your-main-repo/
             ...
 ```
 
-Make sure `FyntracPythonModel/` is somewhere on your Python path so you can
+Make sure `app.python_model/` is somewhere on your Python path so you can
 import from it.
 
 ### Step 2: Set up the MongoDB collection
@@ -91,7 +95,7 @@ No extra pip packages are required — everything is self-contained.
 ```python
 import json
 from pymongo import MongoClient
-from FyntracPythonModel.model_runner import ModelRunner
+from app.python_model.model_runner import ModelRunner
 
 # Connect to MongoDB
 client = MongoClient("mongodb://localhost:27017")

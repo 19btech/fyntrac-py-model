@@ -13,7 +13,7 @@ Usage:
     from app.python_model.model_runner import ModelRunner
 
     runner = ModelRunner()
-    result = runner.run_from_json(python_code, raw_json_records)
+    result = runner.run_from_json(python_code, raw_json_records, posting_date='2023-01-01')
 """
 
 import os
@@ -71,6 +71,10 @@ class ModelRunner:
         )
         python_code = python_code.replace(
             "from dsl_functions import",
+            "from app.python_model.dsl_functions import"
+        )
+        python_code = python_code.replace(
+            "from FyntracPythonModel.dsl_functions import",
             "from app.python_model.dsl_functions import"
         )
         return python_code
@@ -246,16 +250,28 @@ class ModelRunner:
                     raise ValueError("Must provide either python_code or exec_globals")
                 exec_globals = self.compile_template(python_code)
 
-            # Call the processing function
+            # Call the processing function. Inspect the signature explicitly so
+            # we never swallow internal TypeErrors as a "wrong signature" — that
+            # would cause the 3-arg fallback to bind raw_event_data =
+            # override_postingdate (a string), corrupting global state and
+            # producing a cryptic "'str' object has no attribute 'items'" later.
             if 'process_event_data' in exec_globals:
+                import inspect as _inspect
+                _proc = exec_globals['process_event_data']
                 try:
-                    transactions = exec_globals['process_event_data'](
+                    _param_count = len(_inspect.signature(_proc).parameters)
+                except (TypeError, ValueError):
+                    _param_count = 4
+
+                if _param_count >= 4:
+                    transactions = _proc(
                         event_data, raw_event_data,
-                        override_postingdate, override_effectivedate
+                        override_postingdate, override_effectivedate,
                     )
-                except TypeError:
-                    transactions = exec_globals['process_event_data'](
-                        event_data, override_postingdate, override_effectivedate
+                else:
+                    # Older template signature without raw_event_data
+                    transactions = _proc(
+                        event_data, override_postingdate, override_effectivedate,
                     )
             elif 'process_standalone' in exec_globals:
                 transactions = exec_globals['process_standalone'](

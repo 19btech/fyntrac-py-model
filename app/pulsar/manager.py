@@ -422,9 +422,22 @@ class PulsarManager:
                 logger.info("No events found for the given instruments in tenant %s", tenant_id)
                 return
 
-            # Prepare date string
+            # Prepare date string in YYYY-MM-DD format
             date_str = str(execution_date)
-            posting_date_str = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]}"
+            if len(date_str) == 8:
+                posting_date_str = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]}"
+            else:
+                # Fallback for non-8-digit dates (e.g. 2022028)
+                try:
+                    # Try to parse as YYYYMMDD by padding if needed, 
+                    # but be careful not to corrupt the year.
+                    if len(date_str) == 7:
+                        # 2022028 -> 2022-02-08
+                        posting_date_str = f"{date_str[:4]}-{date_str[4:6]}-0{date_str[6:]}"
+                    else:
+                        posting_date_str = date_str
+                except:
+                    posting_date_str = date_str
 
             # 3. Transform the data ONCE for the whole chunk
             from app.python_model.data_transformer import transform
@@ -476,13 +489,18 @@ class PulsarManager:
                     tenant_id,
                 )
 
-            # 5. Run the CPU-bound model execution in a ThreadPoolExecutor
+            # 5. Run model execution in PARALLEL via ThreadPoolExecutor.
+            #    Thread-safety is guaranteed by:
+            #      a) dsl_functions.py globals → threading.local() (per-thread state)
+            #      b) exec_globals → each thread compiles its OWN template from python_code
+            #    Each thread receives python_code (not exec_globals) so model_runner
+            #    calls compile_template() per-thread, giving fully isolated namespaces.
             success_count = 0
             import concurrent.futures
-            
+
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_concurrency) as pool:
                 process_futures = []
-                
+
                 for instrument_id in instrument_ids:
                     instr_data = instrument_data_map.get(instrument_id)
                     if not instr_data:
@@ -497,7 +515,7 @@ class PulsarManager:
                             instr_data[attr_key] = v
                         if k not in instr_data:
                             instr_data[k] = v
-                            
+
                     future = loop.run_in_executor(
                         pool,
                         self._process_instrument_pretransformed,
@@ -506,17 +524,17 @@ class PulsarManager:
                         posting_date_str,
                         instr_data,
                         raw_event_data,
-                        exec_globals,
+                        None,           # exec_globals=None → each thread compiles its own
                         python_code,
                         instrument_event_map.get(instrument_id, {}),
                     )
                     process_futures.append(future)
-                
+
                 acct_periods_cache = {}
 
                 if process_futures:
                     results = await asyncio.gather(*process_futures, return_exceptions=True)
-                    
+
                     for r in results:
                         if isinstance(r, Exception):
                             logger.error("Thread pool execution error: %s", r)
@@ -553,19 +571,19 @@ class PulsarManager:
                                                 is_zero = True
                                         except (TypeError, ValueError):
                                             pass
-                                            
+
                                         ia_data = instrument_attributes_map.get(instrument_id, {})
                                         version_id = ia_data.get("versionId", 0)
-                                        
+
                                         doc = self._build_transaction_activity(
                                             t, tenant_id, instrument_id, job_id, version_id
                                         )
-                                        
+
                                         # Log and discard zero-amount transactions
                                         if is_zero:
                                             logger.info("Discarding zero-amount TransactionActivity for %s: %s", instrument_id, doc)
                                             continue
-                                            
+
                                         # Enrich with context
                                         period_id = doc.get("originalPeriodId", 0)
                                         if period_id not in acct_periods_cache:
@@ -574,7 +592,7 @@ class PulsarManager:
                                             except Exception as e:
                                                 logger.error("Failed to fetch accounting period for periodId %s: %s", period_id, e)
                                                 acct_periods_cache[period_id] = None
-                                                
+
                                         doc["accountingPeriod"] = acct_periods_cache.get(period_id)
                                         if event_doc:
                                             doc["sourceId"]         = str(event_doc.get("_id", ""))
@@ -585,7 +603,7 @@ class PulsarManager:
                                     if docs:
                                         for d in docs:
                                             logger.info("Generated TransactionActivity doc: %s", d)
-                                            
+
                                         await db["TransactionActivity"].insert_many(docs)
                                         logger.info(
                                             "Saved %d TransactionActivity docs for instrument %s",
@@ -602,7 +620,6 @@ class PulsarManager:
                                         instrument_id, tx_err,
                                     )
 
-                            
             logger.info(
                 "Python model: completed batch. Instruments=%d, Succeeded=%d, Failed=%d, "
                 "Tenant=%s, PostingDate=%s JobId=%s",
@@ -819,7 +836,7 @@ class PulsarManager:
 
         python_code: str = ""
 
-        if model_type.upper() == "PYTHON":
+        if model_type.upper() in ["PYTHON", "DSL"]:
             # The file is a raw .py file uploaded via /api/model/upload/python
             # Java: ExcelFileUtil.convertToMongoBinary(dslTemplate) → dslTemplate.getBytes()
             try:
@@ -891,9 +908,6 @@ class PulsarManager:
     ) -> tuple:
         """Synchronous method executed in a separate thread. Runs the model on pre-transformed data."""
         try:
-            logger.debug("Instrument %s: processing pre-transformed data (thread=%s)",
-                        instrument_id, threading.current_thread().name)
-
             from app.python_model.model_runner import ModelRunner
             runner = ModelRunner()
 
@@ -902,12 +916,12 @@ class PulsarManager:
                 event_data=[instr_data],
                 raw_event_data=raw_event_data,
                 override_postingdate=posting_date_str,
-                exec_globals=exec_globals
+                exec_globals=exec_globals,
             )
 
             if result.get("error"):
-                logger.error("Model execution failed for instrument %s: %s", instrument_id, result["error"])
-                return (instrument_id, False, [], event_doc or {})
+                logger.error("Model execution error for instrument %s: %s", instrument_id, result["error"])
+                return (instrument_id, False, [], event_doc or {}, job_id)
 
             transactions = result.get("transactions", [])
             logger.info("Model executed for %s: generated %d transactions", instrument_id, len(transactions))

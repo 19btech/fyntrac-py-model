@@ -51,12 +51,14 @@ cd "$SCRIPT_DIR"
 
 echo "[fyntrac-py-model] Starting on http://$SERVICE_HOST:$SERVICE_PORT ..."
 echo "[fyntrac-py-model] Log → $LOG_FILE"
+# Create new log file every time
+: > "$LOG_FILE"
 
 nohup uvicorn app.main:app \
     --host "$SERVICE_HOST" \
     --port "$SERVICE_PORT" \
     --log-level "$(echo "$LOG_LEVEL" | tr '[:upper:]' '[:lower:]')" \
-    >> "$LOG_FILE" 2>&1 &
+    > "$LOG_FILE" 2>&1 &
 
 PID=$!
 echo "$PID" > "$PID_FILE"
