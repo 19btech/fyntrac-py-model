@@ -1,4 +1,4 @@
-name: Build and Push fyntrac-py-model to GHCR
+name: Build and Push fyntrac-dsl-model to GHCR
 
 on:
   push:
@@ -8,7 +8,7 @@ on:
 env:
   REGISTRY: ghcr.io
   # Maintaining the naming convention from your microservices ecosystem
-  IMAGE_NAME: 19btech/fyntrac/docker/fyntrac-py-model
+  IMAGE_NAME: 19btech/fyntrac/docker/fyntrac-dsl-model
 
 jobs:
   build-and-push:
