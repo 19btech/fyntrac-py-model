@@ -371,15 +371,115 @@ class PulsarManager:
                 "Last chunk processed. Tenant=%s, JobId=%s, Date=%s",
                 tenant_id, numeric_job_id, execution_date,
             )
+            # ── Write EXECUTION_SUMMARY after the final batch ─────────────────────
+            # Aggregate all EXECUTION_BATCH documents for this tenant + postingDate
+            # to produce a single authoritative summary of the entire Python run.
+            await self._write_python_execution_summary(db, tenant_id, execution_date, numeric_job_id)
 
     async def _execute_python_model(self, db, tenant_id: str, execution_date: int, instrument_ids: list, job_id: int):
-        """Execute the Python model logic for a batch of instruments in parallel.
+        """Execute the Python model logic for a batch of instruments in parallel and log the execution."""
+        import time
+        from datetime import datetime, timezone
+        
+        batch_start_time = time.time()
+        error_message = None
+        success_count = 0
+        failed_count = 0
+        
+        try:
+            success_count, failed_count, error_message = await self._execute_python_model_inner(
+                db, tenant_id, execution_date, instrument_ids, job_id
+            )
+        except Exception as e:
+            error_message = str(e)
+            logger.error("Unhandled exception in _execute_python_model_inner: %s", e, exc_info=True)
+        finally:
+            duration_ms = int((time.time() - batch_start_time) * 1000)
+            status = "FAILED"
+            if not error_message:
+                status = "SUCCESS" if failed_count == 0 else "PARTIAL_SUCCESS"
+                
+            log_doc = {
+                "jobId": str(job_id),
+                "tenantId": tenant_id,
+                "postingDate": execution_date,
+                "modelType": "PYTHON",
+                "logType": "EXECUTION_BATCH",
+                "instrumentIds": instrument_ids,
+                "instrumentCount": len(instrument_ids),
+                "successCount": success_count,
+                "failedCount": failed_count,
+                "status": status,
+                "errorMessage": error_message,
+                "durationMs": duration_ms,
+                "createdAt": datetime.now(timezone.utc)
+            }
+            try:
+                await db["ModelExecutionBatchLog"].insert_one(log_doc)
+                logger.info("Inserted ModelExecutionBatchLog for job %s: status=%s duration=%dms", job_id, status, duration_ms)
+            except Exception as log_err:
+                logger.error("Failed to insert ModelExecutionBatchLog: %s", log_err)
 
-        After all instruments are processed (mirroring Java ModelExecutionService.executeExcelModels
-        finally block), publishes:
-          1. ExecuteAggregationMessageRecord → fyntrac-aggregate-execution
-          2. GeneralLedgerMessageRecord      → fyntrac-book-gl-staging
+    async def _write_python_execution_summary(self, db, tenant_id: str, execution_date: int, job_id: int):
+        """Aggregate all EXECUTION_BATCH logs for this tenant+postingDate and write one EXECUTION_SUMMARY record.
+
+        Called after the final Pulsar batch (isLast=True) completes. This produces
+        the authoritative end-to-end summary of the entire Python model run.
         """
+        from datetime import datetime, timezone
+        try:
+            batch_logs = await db["ModelExecutionBatchLog"].find(
+                {
+                    "tenantId": tenant_id,
+                    "postingDate": execution_date,
+                    "logType": "EXECUTION_BATCH",
+                    "modelType": "PYTHON",
+                }
+            ).to_list(length=None)
+
+            total_batches      = len(batch_logs)
+            total_instruments  = sum(d.get("instrumentCount", 0) for d in batch_logs)
+            total_success      = sum(d.get("successCount",    0) for d in batch_logs)
+            total_failed       = sum(d.get("failedCount",     0) for d in batch_logs)
+            total_duration_ms  = sum(d.get("durationMs",      0) for d in batch_logs)
+            error_messages     = [d["errorMessage"] for d in batch_logs
+                                  if d.get("errorMessage") and d["errorMessage"].strip()]
+
+            if total_failed == 0 and not error_messages:
+                summary_status = "SUCCESS"
+            elif total_success == 0:
+                summary_status = "FAILED"
+            else:
+                summary_status = "PARTIAL_SUCCESS"
+
+            summary_doc = {
+                "jobId":           str(job_id),
+                "tenantId":        tenant_id,
+                "postingDate":     execution_date,
+                "modelType":       "PYTHON",
+                "logType":         "EXECUTION_SUMMARY",
+                "totalBatches":    total_batches,
+                "instrumentCount": total_instruments,
+                "successCount":    total_success,
+                "failedCount":     total_failed,
+                "status":          summary_status,
+                "errorMessage":    "; ".join(error_messages) if error_messages else None,
+                "durationMs":      total_duration_ms,
+                "createdAt":       datetime.now(timezone.utc),
+            }
+            await db["ModelExecutionBatchLog"].insert_one(summary_doc)
+            logger.info(
+                "Python EXECUTION_SUMMARY written: tenant=%s date=%s batches=%d "
+                "instruments=%d success=%d failed=%d status=%s duration=%dms",
+                tenant_id, execution_date, total_batches, total_instruments,
+                total_success, total_failed, summary_status, total_duration_ms,
+            )
+        except Exception as e:
+            logger.error("Failed to write Python EXECUTION_SUMMARY: %s", e, exc_info=True)
+
+
+    async def _execute_python_model_inner(self, db, tenant_id: str, execution_date: int, instrument_ids: list, job_id: int):
+        """Inner method that performs the actual model logic."""
         collection = db["EventHistory"]
         max_concurrency = min(32, (os.cpu_count() or 1) * 4)
         
@@ -395,10 +495,10 @@ class PulsarManager:
         try:
             python_code, exec_globals = await self._load_active_model(db, tenant_id)
             if not python_code or exec_globals is None:
-                return   # error already logged inside helper
+                return (0, len(instrument_ids), "Active model not found or failed to compile.")
         except Exception as e:
             logger.error("Unexpected error loading model for tenant %s: %s", tenant_id, e)
-            return
+            return (0, len(instrument_ids), f"Unexpected error loading model: {e}")
 
         # 2. Fetch all events for the entire chunk in a single query
         logger.info("Fetching data for %d instruments from MongoDB...", len(instrument_ids))
@@ -419,11 +519,11 @@ class PulsarManager:
                     all_events.append(doc)
             except Exception as e:
                 logger.error("Error fetching data for chunk: %s", e)
-                return
+                return (0, len(instrument_ids), f"Error fetching data: {e}")
 
             if not all_events:
                 logger.info("No events found for the given instruments in tenant %s", tenant_id)
-                return
+                return (0, 0, None)
 
             # Prepare date string in YYYY-MM-DD format
             date_str = str(execution_date)
@@ -453,7 +553,7 @@ class PulsarManager:
                 )
             except Exception as e:
                 logger.error("Failed to transform data for chunk: %s", e)
-                return
+                return (0, len(instrument_ids), f"Failed to transform data: {e}")
 
             # Map event_data and raw event docs by instrumentid for O(1) lookup
             instrument_data_map = {}
@@ -629,6 +729,9 @@ class PulsarManager:
                 len(instrument_ids), success_count, len(process_futures) - success_count,
                 tenant_id, execution_date, job_id
             )
+            
+            final_success_count = success_count
+            final_failed_count = len(process_futures) - success_count
 
         finally:
             # ── Mirror Java ModelExecutionService finally block ───────────────
@@ -653,6 +756,8 @@ class PulsarManager:
                 )
             except Exception as gl_err:
                 logger.error("Failed to publish GL staging message for jobId=%s: %s", job_id, gl_err)
+
+        return (final_success_count, final_failed_count, None)
 
     def _deserialize_cache_list(self, raw: bytes, cache_key: str):
         """Deserialize a Memcached value written by Java's memcachedRepository.
