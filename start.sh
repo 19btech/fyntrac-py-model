@@ -32,6 +32,13 @@ if [[ -f "$ENV_FILE" ]]; then
     set +o allexport
 fi
 
+# ── Local Overrides for Host Execution ───────────────────────────────────────
+# When running locally via this script (not in Docker), we must point to localhost
+# instead of the internal Docker network aliases.
+export MONGODB_HOST="127.0.0.1"
+export PULSAR_SERVICE_URL="pulsar://127.0.0.1:6650"
+export MEMCACHED_HOST="127.0.0.1"
+
 # Defaults if not set in .env
 SERVICE_HOST="${SERVICE_HOST:-0.0.0.0}"
 SERVICE_PORT="${SERVICE_PORT:-8090}"
