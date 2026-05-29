@@ -46,6 +46,7 @@ class Settings(BaseSettings):
 
     # ── Pulsar — Python Model Execution ─────────────────────────────────
     PULSAR_PYTHON_MODEL_EXECUTION_TOPIC: str = "persistent://public/default/fyntrac-python-model-execution"
+    PULSAR_PYTHON_MODEL_COMPLETION_TOPIC: str = "persistent://public/default/fyntrac-python-model-completion"
     PULSAR_PYTHON_MODEL_SUBSCRIPTION_NAME: str = "fyntrac-py-model-execution-sub"
 
     # ── Pulsar — Downstream Producers (mirror Java model service) ────────

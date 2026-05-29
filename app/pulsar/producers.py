@@ -2,6 +2,7 @@
 Pulsar producers that mirror the Java-side:
   - AggregationMessageProducer  → topic: fyntrac-aggregate-execution
   - GeneralLedgerMessageProducer → topic: fyntrac-book-gl-staging
+  - PythonModelCompletionProducer → topic: fyntrac-python-model-completion
 
 Message schemas match Records.ExecuteAggregationMessageRecord and
 Records.GeneralLedgerMessageRecord in the subledger common module.
@@ -116,6 +117,59 @@ class GeneralLedgerMessageProducer:
         except Exception as exc:
             logger.error(
                 "GeneralLedgerMessageProducer: failed to publish message: %s", exc
+            )
+            raise
+
+    def close(self) -> None:
+        if self._producer:
+            try:
+                self._producer.close()
+            except Exception:
+                pass
+            self._producer = None
+
+class PythonModelCompletionProducer:
+    """Publishes completion messages back to the Dataloader Orchestrator.
+
+    Payload:
+        {
+            "correlationId": str,
+            "success": bool,
+            "result": str,   # JSON payload of results or summary
+            "error": str     # Error message if success=False
+        }
+    """
+
+    def __init__(self, client: pulsar.Client, topic: str):
+        self._producer: Optional[pulsar.Producer] = None
+        self._client = client
+        self._topic = topic
+
+    def _ensure_producer(self) -> pulsar.Producer:
+        if self._producer is None:
+            self._producer = self._client.create_producer(self._topic)
+        return self._producer
+
+    async def send_completion(
+        self, correlation_id: str, success: bool, result: str, error: str, loop: asyncio.AbstractEventLoop
+    ) -> None:
+        payload = {
+            "correlationId": correlation_id,
+            "success": success,
+            "result": result,
+            "error": error,
+        }
+        try:
+            producer = self._ensure_producer()
+            data = json.dumps(payload).encode("utf-8")
+            await loop.run_in_executor(None, lambda: producer.send(data, properties={"correlationId": correlation_id}))
+            logger.info(
+                "PythonModelCompletionProducer: published completion for correlationId=%s success=%s",
+                correlation_id, success,
+            )
+        except Exception as exc:
+            logger.error(
+                "PythonModelCompletionProducer: failed to publish completion: %s", exc
             )
             raise
 

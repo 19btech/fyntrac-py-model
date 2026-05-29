@@ -14,7 +14,7 @@ from bson.decimal128 import Decimal128
 
 from app.config import Settings
 from app.db.mongodb import mongo_manager
-from app.pulsar.producers import AggregationMessageProducer, GeneralLedgerMessageProducer
+from app.pulsar.producers import PythonModelCompletionProducer
 
 logger = logging.getLogger(__name__)
 
@@ -29,8 +29,6 @@ class PulsarManager:
         self._python_model_consumer_task: Optional[asyncio.Task] = None
         self._stop_event = asyncio.Event()
         self._memcache_client: Optional[MemcacheClient] = None
-        self._aggregation_producer: Optional[AggregationMessageProducer] = None
-        self._gl_producer: Optional[GeneralLedgerMessageProducer] = None
 
     def start(self, settings: Settings) -> None:
         """Initialise Pulsar client and start consumer loop."""
@@ -55,13 +53,9 @@ class PulsarManager:
                 timeout=5
             )
 
-            # Instantiate downstream producers (mirror Java AggregationMessageProducer
-            # and GeneralLedgerMessageProducer)
-            self._aggregation_producer = AggregationMessageProducer(
-                self._client, settings.PULSAR_AGGREGATION_TOPIC
-            )
-            self._gl_producer = GeneralLedgerMessageProducer(
-                self._client, settings.PULSAR_GL_STAGING_TOPIC
+            # Instantiate completion producer (sends results back to Java Orchestrator)
+            self._completion_producer = PythonModelCompletionProducer(
+                self._client, settings.PULSAR_PYTHON_MODEL_COMPLETION_TOPIC
             )
 
             # Start the background tasks within the current asyncio event loop
@@ -93,11 +87,9 @@ class PulsarManager:
             logger.info("Pulsar connection closed.")
 
         # Close downstream producers
-        if self._aggregation_producer:
-            self._aggregation_producer.close()
-        if self._gl_producer:
-            self._gl_producer.close()
-            
+        if self._completion_producer:
+            self._completion_producer.close()
+
         if self._memcache_client:
             self._memcache_client.close()
             logger.info("Memcache connection closed.")
@@ -313,13 +305,14 @@ class PulsarManager:
                     raw = raw[5:]
 
                 payload = json.loads(raw.decode('utf-8'))
+                correlation_id = msg.properties().get("correlationId")
                 logger.info(
-                    "Received Python model execution message: tenantId=%s, executionDate=%s, key=%s, isLast=%s",
-                    payload.get("tenantId"), payload.get("executionDate"),
+                    "Received Python model execution message: tenantId=%s, correlationId=%s, executionDate=%s, key=%s, isLast=%s",
+                    payload.get("tenantId"), correlation_id, payload.get("executionDate"),
                     payload.get("key"), payload.get("isLast"),
                 )
 
-                await self._process_python_model_execution(payload)
+                await self._process_python_model_execution(payload, correlation_id)
 
                 consumer.acknowledge(msg)
             except json.JSONDecodeError as e:
@@ -331,7 +324,7 @@ class PulsarManager:
 
         consumer.close()
 
-    async def _process_python_model_execution(self, payload: dict):
+    async def _process_python_model_execution(self, payload: dict, correlation_id: str = None):
         """Handle a PythonModelExecutionMessageRecord from Java dataloader.
 
         Java record fields (Records.PythonModelExecutionMessageRecord):
@@ -364,7 +357,7 @@ class PulsarManager:
             return
 
         numeric_job_id = int(time.time() * 1000)
-        await self._execute_python_model(db, tenant_id, execution_date, instrument_ids, numeric_job_id)
+        await self._execute_python_model(db, tenant_id, execution_date, instrument_ids, numeric_job_id, correlation_id)
 
         if is_last:
             logger.info(
@@ -376,7 +369,7 @@ class PulsarManager:
             # to produce a single authoritative summary of the entire Python run.
             await self._write_python_execution_summary(db, tenant_id, execution_date, numeric_job_id)
 
-    async def _execute_python_model(self, db, tenant_id: str, execution_date: int, instrument_ids: list, job_id: int):
+    async def _execute_python_model(self, db, tenant_id: str, execution_date: int, instrument_ids: list, job_id: int, correlation_id: str = None):
         """Execute the Python model logic for a batch of instruments in parallel and log the execution."""
         import time
         from datetime import datetime, timezone
@@ -419,6 +412,19 @@ class PulsarManager:
                 logger.info("Inserted ModelExecutionBatchLog for job %s: status=%s duration=%dms", job_id, status, duration_ms)
             except Exception as log_err:
                 logger.error("Failed to insert ModelExecutionBatchLog: %s", log_err)
+
+            if correlation_id:
+                try:
+                    loop = asyncio.get_running_loop()
+                    await self._completion_producer.send_completion(
+                        correlation_id,
+                        success=(status == "SUCCESS"),
+                        result=json.dumps({"jobId": job_id, "status": status, "successCount": success_count}),
+                        error=error_message,
+                        loop=loop
+                    )
+                except Exception as comp_err:
+                    logger.error("Failed to send completion signal for correlationId %s: %s", correlation_id, comp_err)
 
     async def _write_python_execution_summary(self, db, tenant_id: str, execution_date: int, job_id: int):
         """Aggregate all EXECUTION_BATCH logs for this tenant+postingDate and write one EXECUTION_SUMMARY record.
@@ -733,29 +739,9 @@ class PulsarManager:
             final_success_count = success_count
             final_failed_count = len(process_futures) - success_count
 
-        finally:
-            # ── Mirror Java ModelExecutionService finally block ───────────────
-            # Publish aggregation trigger → consumed by Java AggregationService
-            # Publish GL booking trigger  → consumed by Java GL service
-            # Both happen regardless of success, partial failure, or empty event set.
-            try:
-                await self._aggregation_producer.execute_aggregation(
-                    tenant_id=tenant_id,
-                    job_id=job_id,
-                    aggregation_date=execution_date,  # YYYYMMDD int, same as postingDate
-                    loop=loop,
-                )
-            except Exception as agg_err:
-                logger.error("Failed to publish aggregation message for jobId=%s: %s", job_id, agg_err)
-
-            try:
-                await self._gl_producer.book_temp_gl(
-                    tenant_id=tenant_id,
-                    job_id=job_id,
-                    loop=loop,
-                )
-            except Exception as gl_err:
-                logger.error("Failed to publish GL staging message for jobId=%s: %s", job_id, gl_err)
+        except Exception as e:
+            logger.error("Unexpected error during model execution for tenant %s: %s", tenant_id, e, exc_info=True)
+            return (0, len(instrument_ids), f"Unexpected error: {e}")
 
         return (final_success_count, final_failed_count, None)
 
