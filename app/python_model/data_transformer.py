@@ -14,11 +14,14 @@ This module:
 4. Iterates ALL instruments (no limit)
 """
 
+import logging
 import re
 import uuid
 from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 try:
     from app.python_model.dsl_functions import normalize_date
@@ -323,9 +326,21 @@ def build_event_definitions_from_import(
 # Merging: combine multiple events by instrumentid
 # ---------------------------------------------------------------------------
 def get_latest_data_per_instrument(data_rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-    """Get latest postingdate row per instrumentid."""
+    """Get latest postingdate row per instrumentid (case-insensitive field matching).
+
+    Defensively skips any row that is not a dict (e.g. a stringified JSON object
+    that slipped through during import). Such rows are logged so the user can fix
+    the source data instead of seeing a cryptic ``'str' object has no attribute 'items'``.
+    """
     latest_data = {}
-    for row in data_rows:
+    for idx, row in enumerate(data_rows):
+        if not isinstance(row, dict):
+            logger.warning(
+                "Skipping non-dict row at index %d in event data (got %s). "
+                "Re-import the source file — each row must be a JSON object.",
+                idx, type(row).__name__,
+            )
+            continue
         instrument_id = get_field_case_insensitive(row, 'instrumentid', '')
         posting_date = get_field_case_insensitive(row, 'postingdate', '')
 
@@ -342,16 +357,111 @@ def get_latest_data_per_instrument(data_rows: List[Dict[str, Any]]) -> Dict[str,
     return latest_data
 
 
+_STANDARD_ROW_KEYS = {'instrumentid', 'postingdate', 'effectivedate', 'subinstrumentid'}
+
+
+def _report_collapsed_subinstruments(event_name, data_rows, latest_data, seen):
+    """Warn when the instrument-grain merge is about to discard real values.
+
+    ``merge_event_data_by_instrument`` keeps ONE row per instrumentid. When an
+    event is sub-instrument grained, the surviving row is simply the first
+    after the canonical sort (ties on postingDate are not broken by anything
+    meaningful), so a differing value on another sub-instrument disappears --
+    e.g. three REVENUE_BALANCE rows where only SSP6KXFYZJZB carries
+    -2.4988 collapse to the alphabetically-first row's 0, and a rule reading
+    the merged field nets off nothing.
+
+    Behaviour is unchanged; this only makes the loss visible. Reported once
+    per (event, field) so a wide batch cannot flood the log. Values are
+    business data, so this logs at WARNING only when divergence is real.
+    """
+    if not logger.isEnabledFor(logging.WARNING):
+        return
+    by_instrument = defaultdict(list)
+    for row in data_rows:
+        if not isinstance(row, dict):
+            continue
+        iid = get_field_case_insensitive(row, 'instrumentid', '')
+        if iid:
+            by_instrument[iid].append(row)
+
+    for iid, rows in by_instrument.items():
+        if len(rows) < 2:
+            continue
+        kept = latest_data.get(iid)
+        if not isinstance(kept, dict):
+            continue
+        kept_sub = get_field_case_insensitive(kept, 'subinstrumentid', '')
+        discarded = [r for r in rows if r is not kept]
+
+        # (a) fields the kept row HAS, where a discarded row disagrees
+        for key in list(kept.keys()):
+            if key.lower() in _STANDARD_ROW_KEYS or (event_name, key) in seen:
+                continue
+            kept_val = kept[key]
+            diverging = [
+                (get_field_case_insensitive(r, 'subinstrumentid', ''), r[key])
+                for r in discarded if key in r and r[key] != kept_val
+            ]
+            if diverging:
+                seen.add((event_name, key))
+                logger.warning(
+                    "%s.%s differs across %d sub-instrument rows for instrument %s. "
+                    "The instrument-grain merge keeps sub=%s value=%r and DISCARDS %s. "
+                    "If the rule posts per sub-instrument, read this with "
+                    "collect_by_subinstrument(%s.%s) instead of the merged field.",
+                    event_name, key, len(rows), iid, kept_sub, kept_val,
+                    '; '.join(f"sub={s} value={v!r}" for s, v in diverging[:5]),
+                    event_name, key,
+                )
+
+        # (b) fields that exist ONLY on discarded rows -- lost entirely
+        for r in discarded:
+            for key, val in r.items():
+                if key.lower() in _STANDARD_ROW_KEYS or key in kept:
+                    continue
+                if (event_name, key) in seen:
+                    continue
+                seen.add((event_name, key))
+                logger.warning(
+                    "%s.%s exists only on sub-instrument %s (value=%r) for instrument "
+                    "%s and is ABSENT from the merged row (kept sub=%s). A rule "
+                    "referencing the merged field will see nothing; use "
+                    "collect_by_subinstrument(%s.%s).",
+                    event_name, key,
+                    get_field_case_insensitive(r, 'subinstrumentid', ''), val,
+                    iid, kept_sub, event_name, key,
+                )
+
+
 def merge_event_data_by_instrument(event_data_dict: Dict[str, List[Dict]]) -> List[Dict]:
     """
     Merge data from multiple events by instrumentid.
     Each event's fields are prefixed with EVENT_NAME_ to avoid conflicts.
+    Also provides event-specific postingdate, effectivedate, and subinstrumentid.
+
+    Hierarchy: postingDate → instrumentId → subInstrumentId → effectiveDates
+
+    If subInstrumentId is missing or null, it defaults to "1".
     Iterates ALL instruments — no limit.
     """
     merged_data = {}
+    bad_row_events = []
+    _collapse_seen = set()
 
     for event_name, data_rows in event_data_dict.items():
-        latest_data = get_latest_data_per_instrument(data_rows)
+        # Pre-flight check: record any row that is not a dict so the offending
+        # event/row can be named in the diagnostic below.
+        if isinstance(data_rows, list):
+            for idx, row in enumerate(data_rows):
+                if not isinstance(row, dict):
+                    bad_row_events.append((event_name, idx, type(row).__name__))
+        _safe_rows = data_rows if isinstance(data_rows, list) else []
+        latest_data = get_latest_data_per_instrument(_safe_rows)
+        # Surface any sub-instrument values this instrument-grain merge drops.
+        _report_collapsed_subinstruments(
+            event_name, _safe_rows, latest_data, _collapse_seen
+        )
 
         for instrument_id, row in latest_data.items():
             if instrument_id not in merged_data:
@@ -376,12 +486,31 @@ def merge_event_data_by_instrument(event_data_dict: Dict[str, List[Dict]]) -> Li
             merged_data[instrument_id][f"{event_name}_effectivedate"] = event_effectivedate
             merged_data[instrument_id][f"{event_name}_subinstrumentid"] = str(event_subinstrumentid)
 
+            if not isinstance(row, dict):
+                # Already logged above; skip safely.
+                continue
             for key, value in row.items():
                 key_lower = key.lower()
                 if key_lower not in ['instrumentid', 'postingdate', 'effectivedate', 'subinstrumentid']:
                     prefixed_key = f"{event_name}_{key}"
                     merged_data[instrument_id][prefixed_key] = value
                     merged_data[instrument_id][key] = value
+
+    if bad_row_events:
+        # Name the first offending row so the source file can be fixed.
+        #
+        # NOTE: the upstream FyntracPythonModel copy raises ValueError here.
+        # That is deliberately NOT done: these rows are already skipped today
+        # and the good instruments still process, so raising would turn one
+        # malformed row into a whole-batch (all-instrument) abort. Logged
+        # instead, which keeps the diagnostic without the availability change.
+        evt, idx, kind = bad_row_events[0]
+        logger.error(
+            "Event '%s' has malformed data: row #%d is a %s, not an object. "
+            "Re-import the source file — each row must be a JSON object "
+            "(total bad rows: %d). These rows were skipped.",
+            evt, idx, kind, len(bad_row_events),
+        )
 
     return list(merged_data.values())
 

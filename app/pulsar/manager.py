@@ -19,6 +19,82 @@ from app.pulsar.producers import PythonModelCompletionProducer
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Model-execution worker process
+# ---------------------------------------------------------------------------
+# These two functions run inside a ProcessPoolExecutor worker — a completely
+# separate OS process from the one that dispatches them, with its own
+# interpreter and its own memory. They are module-level (NOT PulsarManager
+# methods) on purpose: ProcessPoolExecutor sends its target callable to the
+# worker by pickling a reference to it, and a bound method's pickled form
+# includes `self` — which here would be a PulsarManager holding the Pulsar
+# client, the memcached client, and other objects that can't be (and
+# shouldn't be) pickled across a process boundary.
+#
+# raw_event_data and python_code are identical for every instrument in a
+# batch, so they are handed to each worker exactly ONCE, when the pool
+# starts that worker (see initializer=/initargs= at the call site), and
+# cached here in module globals that live only inside that one worker
+# process. Storing them at module scope like this is safe specifically
+# BECAUSE each worker is its own process: there is no other instrument's
+# task that could ever observe or overwrite this copy, unlike a thread-based
+# design where a module global is genuinely shared and would need explicit
+# synchronisation (or threading.local()) to avoid instruments jumbling.
+_worker_tenant_id: str = ""
+_worker_posting_date_str: str = ""
+_worker_raw_event_data: dict = {}
+_worker_python_code: str = ""
+
+
+def _init_model_worker(tenant_id: str, posting_date_str: str, raw_event_data: dict, python_code: str) -> None:
+    """ProcessPoolExecutor calls this once, in-process, right after forking each worker."""
+    global _worker_tenant_id, _worker_posting_date_str, _worker_raw_event_data, _worker_python_code
+    _worker_tenant_id = tenant_id
+    _worker_posting_date_str = posting_date_str
+    _worker_raw_event_data = raw_event_data
+    _worker_python_code = python_code
+
+
+def _run_instrument_model_process(instrument_id: str, instr_data: dict, event_doc: dict = None) -> tuple:
+    """Runs the DSL model for exactly ONE instrument, fully isolated in its own OS process.
+
+    "Isolated" here is physical, not just a coding convention: this
+    function's entire call stack — the compiled template, dsl_functions'
+    module state, every local variable — exists only in this worker
+    process's memory. A bug that would make two instruments' state bleed
+    into each other in a shared-memory design (thread or otherwise) simply
+    has no channel to do that here.
+    """
+    try:
+        from app.python_model.model_runner import ModelRunner
+        runner = ModelRunner()
+
+        result = runner.run(
+            python_code=_worker_python_code,
+            event_data=[instr_data],
+            raw_event_data=_worker_raw_event_data,
+            override_postingdate=_worker_posting_date_str,
+            exec_globals=None,  # this process compiles its own template -> fully isolated namespace
+        )
+
+        if result.get("error"):
+            logger.error("Model execution error for instrument %s: %s", instrument_id, result["error"])
+            # NOTE: `job_id` is not available here (this worker process never
+            # receives it) and the caller unpacks exactly four values --
+            # see `instrument_id, success, transactions, event_doc = r`.
+            # Returning it raised NameError, which the outer handler then
+            # reported instead of the real model error.
+            return (instrument_id, False, [], event_doc or {})
+
+        transactions = result.get("transactions", [])
+        logger.info("Model executed for %s: generated %d transactions", instrument_id, len(transactions))
+
+        return (instrument_id, True, transactions, event_doc or {})
+    except Exception as e:
+        logger.error("Error in worker process for instrument %s: %s", instrument_id, e, exc_info=True)
+        return (instrument_id, False, [], event_doc or {})
+
+
 class PulsarManager:
     """Manages the Pulsar client and background consumer task."""
 
@@ -487,11 +563,29 @@ class PulsarManager:
     async def _execute_python_model_inner(self, db, tenant_id: str, execution_date: int, instrument_ids: list, job_id: int):
         """Inner method that performs the actual model logic."""
         collection = db["EventHistory"]
-        max_concurrency = min(32, (os.cpu_count() or 1) * 4)
-        
-        logger.info("Executing Python model for %d instruments in parallel (threads=%d) "
+        # Model execution is CPU-bound pure-Python (exec() of the generated
+        # template) with no I/O, so a ThreadPoolExecutor here would NOT be
+        # parallel: CPython's GIL lets only one thread run Python bytecode at
+        # a time, and 4x-oversubscribing threads for that kind of work just
+        # adds scheduling overhead (measured 0.90x — i.e. SLOWER — versus
+        # running the same batch serially, on this machine). One OS process
+        # per worker sidesteps the GIL entirely, so size the pool to the
+        # actual core count instead, capped by how many instruments there
+        # are (no point forking more workers than there is work).
+        #
+        # os.cpu_count() reports every core this process can SEE, not a fair
+        # share of them. That's correct when this is the only instance on its
+        # host. When it isn't — e.g. a second CLI instance on the same box, or
+        # docker-compose --scale without a per-container `cpus:` limit — every
+        # instance would independently size to the SAME full core count and
+        # they'd oversubscribe and contend with each other. MAX_PROCESS_WORKERS
+        # lets an operator cap this explicitly per instance in that case.
+        cpu_budget = self._settings.MAX_PROCESS_WORKERS if self._settings and self._settings.MAX_PROCESS_WORKERS else (os.cpu_count() or 1)
+        max_process_workers = min(cpu_budget, max(1, len(instrument_ids)))
+
+        logger.info("Executing Python model for %d instruments in parallel (processes=%d) "
                      "tenant=%s postingDate=%s",
-                     len(instrument_ids), max_concurrency, tenant_id, execution_date)
+                     len(instrument_ids), max_process_workers, tenant_id, execution_date)
 
         # 1. Fetch active Models → resolve ModelFile → extract Python code
         #    Mirrors Java: modelDataService.getActiveModels(tenantId)
@@ -598,16 +692,36 @@ class PulsarManager:
                     tenant_id,
                 )
 
-            # 5. Run model execution in PARALLEL via ThreadPoolExecutor.
-            #    Thread-safety is guaranteed by:
-            #      a) dsl_functions.py globals → threading.local() (per-thread state)
-            #      b) exec_globals → each thread compiles its OWN template from python_code
-            #    Each thread receives python_code (not exec_globals) so model_runner
-            #    calls compile_template() per-thread, giving fully isolated namespaces.
+            # 5. Run model execution with TRUE PARALLELISM via ProcessPoolExecutor.
+            #    Each instrument runs in its own OS PROCESS, not a thread:
+            #      - Actually uses multiple CPU cores. Threads cannot, for this
+            #        workload — see the max_process_workers comment above.
+            #      - Isolation is now physical, not just logical: a worker
+            #        process has its own interpreter and its own memory, so
+            #        one instrument's dsl_functions state (current instrument
+            #        id, transaction results, print output, schedule-eval
+            #        guard, ...) cannot leak into another's no matter what
+            #        that module does. The previous design relied on every
+            #        one of those globals correctly going through
+            #        threading.local(); this design does not depend on that
+            #        at all — there's nothing to share by construction.
+            #    raw_event_data and python_code are IDENTICAL for every
+            #    instrument in this batch, so they're handed to each worker
+            #    process exactly ONCE via initializer=/initargs= (run when
+            #    the worker starts, not per instrument) rather than being
+            #    re-pickled and re-sent for every single instrument.
             success_count = 0
             import concurrent.futures
+            import multiprocessing
 
-            with concurrent.futures.ThreadPoolExecutor(max_workers=max_concurrency) as pool:
+            mp_ctx = multiprocessing.get_context("fork")  # explicit: this service runs on Linux
+
+            with concurrent.futures.ProcessPoolExecutor(
+                max_workers=max_process_workers,
+                mp_context=mp_ctx,
+                initializer=_init_model_worker,
+                initargs=(tenant_id, posting_date_str, raw_event_data, python_code),
+            ) as pool:
                 process_futures = []
 
                 for instrument_id in instrument_ids:
@@ -627,14 +741,9 @@ class PulsarManager:
 
                     future = loop.run_in_executor(
                         pool,
-                        self._process_instrument_pretransformed,
-                        tenant_id,
+                        _run_instrument_model_process,
                         instrument_id,
-                        posting_date_str,
                         instr_data,
-                        raw_event_data,
-                        None,           # exec_globals=None → each thread compiles its own
-                        python_code,
                         instrument_event_map.get(instrument_id, {}),
                     )
                     process_futures.append(future)
@@ -988,42 +1097,6 @@ class PulsarManager:
         except Exception as e:
             logger.error("Failed to compile model '%s': %s", model_name, e)
             return None, None
-
-    def _process_instrument_pretransformed(
-        self,
-        tenant_id: str,
-        instrument_id: str,
-        posting_date_str: str,
-        instr_data: dict,
-        raw_event_data: dict,
-        exec_globals: dict,
-        python_code: str,
-        event_doc: dict = None,
-    ) -> tuple:
-        """Synchronous method executed in a separate thread. Runs the model on pre-transformed data."""
-        try:
-            from app.python_model.model_runner import ModelRunner
-            runner = ModelRunner()
-
-            result = runner.run(
-                python_code=python_code,
-                event_data=[instr_data],
-                raw_event_data=raw_event_data,
-                override_postingdate=posting_date_str,
-                exec_globals=exec_globals,
-            )
-
-            if result.get("error"):
-                logger.error("Model execution error for instrument %s: %s", instrument_id, result["error"])
-                return (instrument_id, False, [], event_doc or {}, job_id)
-
-            transactions = result.get("transactions", [])
-            logger.info("Model executed for %s: generated %d transactions", instrument_id, len(transactions))
-
-            return (instrument_id, True, transactions, event_doc or {})
-        except Exception as e:
-            logger.error("Error in thread processing instrument %s: %s", instrument_id, e, exc_info=True)
-            return (instrument_id, False, [], event_doc or {})
 
     # ------------------------------------------------------------------
     # Attribute helpers

@@ -3,8 +3,10 @@ Application configuration loaded from environment variables.
 Mirrors the MongoDB and ZITADEL settings from the existing Java services.
 """
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings
 from functools import lru_cache
+from typing import Optional
 
 
 class Settings(BaseSettings):
@@ -16,6 +18,17 @@ class Settings(BaseSettings):
     # ── Service ──────────────────────────────────────────────────────────
     SERVICE_PORT: int = 8090
     SERVICE_HOST: str = "0.0.0.0"
+
+    # Caps the OS-process pool used for parallel model execution (one process
+    # per instrument within a chunk — see PulsarManager._execute_python_model_inner).
+    # Unset (None) means "auto": use every core this process can see
+    # (os.cpu_count()), which is correct when this is the ONLY instance on its
+    # host/container. Set this explicitly when running more than one instance
+    # on a host that isn't otherwise carving up CPU for you — e.g. two `start.sh`
+    # processes on the same bare-metal box, or docker-compose --scale without
+    # per-container `cpus:` limits — so the instances split the cores instead
+    # of each trying to claim all of them and fighting over the same ones.
+    MAX_PROCESS_WORKERS: Optional[int] = None
 
     # ── MongoDB ──────────────────────────────────────────────────────────
     # Matches the properties in application-dev.properties from subledger/common
@@ -62,6 +75,19 @@ class Settings(BaseSettings):
         env_file = ".env"
         env_file_encoding = "utf-8"
         case_sensitive = True
+
+    @field_validator("MAX_PROCESS_WORKERS", mode="before")
+    @classmethod
+    def _empty_env_var_means_unset(cls, v):
+        """A deployment template that always substitutes a variable — e.g.
+        docker-compose's `${MAX_PROCESS_WORKERS}` with nothing set for it —
+        passes an EMPTY STRING, not "the variable is absent". Without this,
+        that empty string fails int parsing and crashes the whole service at
+        startup over an optional tuning knob nobody set. Treat "" the same as
+        never having set it (falls through to the auto-sizing default)."""
+        if v == "":
+            return None
+        return v
 
     @property
     def mongodb_connection_uri(self) -> str:

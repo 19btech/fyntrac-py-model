@@ -1,7 +1,45 @@
 
 # ============= Imports (must be at top) =============
+import logging
 import math
+import os
+import re
 from datetime import datetime, timedelta
+
+logger = logging.getLogger(__name__)
+
+# Opt-in per-transaction tracing. Off by default (createTransaction runs in a
+# hot loop). Set FYNTRAC_TRACE_TRANSACTIONS=true to log every emitted
+# transaction together with the DSL rule line that produced it.
+_TRACE_TRANSACTIONS = os.getenv(
+    'FYNTRAC_TRACE_TRANSACTIONS', 'false'
+).strip().lower() in ('1', 'true', 'yes', 'on')
+
+
+def _dsl_call_site():
+    """Locate the generated-template frame that called us.
+
+    Returns (dsl_line, source_text). The template is exec'd under the filename
+    "<dsl_template>" and compile_template stashes its post-processed text in
+    that frame's globals as __fyntrac_source__, so the emitting statement --
+    and its "# DSL_LINE:N" marker, i.e. the line of the ORIGINAL DSL rule --
+    can both be recovered.
+    """
+    try:
+        import inspect
+        f = inspect.currentframe()
+        while f is not None:
+            if f.f_code.co_filename == '<dsl_template>':
+                src = f.f_globals.get('__fyntrac_source__') or ''
+                lines = src.split('\n')
+                text = (lines[f.f_lineno - 1].strip()
+                        if 1 <= f.f_lineno <= len(lines) else '')
+                m = re.search(r'# DSL_LINE:(\d+)', text)
+                return (int(m.group(1)) if m else None), text
+            f = f.f_back
+    except Exception:
+        pass
+    return None, None
 
 import threading
 
@@ -184,6 +222,31 @@ Complete DSL Functions Library - 101 Financial Functions
 
 # ============= Date Normalization Helper =============
 
+# A date followed by a time is separated by 'T' or a space. Deciding that a
+# string IS such a timestamp requires checking that the part BEFORE the
+# separator actually looks like a date -- splitting blindly truncated every
+# value containing a capital T or a space. 'CDB_PRTDIG_US_NEW_1499_PRINT'
+# became 'CDB_PR', so distinct product codes collapsed onto one key and
+# lookup() silently returned the first row that shared the 6-char stub.
+_DATE_HEAD_RE = re.compile(
+    r'^\d{4}-\d{1,2}-\d{1,2}$'
+    r'|^\d{4}/\d{1,2}/\d{1,2}$'
+    r'|^\d{1,2}[-/]\d{1,2}[-/]\d{2,4}$'
+)
+
+
+def _date_part_before(date_str: str, sep: str):
+    """Return the text before `sep` when it is a date, else None.
+
+    Strips the time from an ISO timestamp without mangling ordinary strings
+    that merely happen to contain the separator.
+    """
+    if sep not in date_str:
+        return None
+    head = date_str.split(sep)[0].strip()
+    return head if _DATE_HEAD_RE.match(head) else None
+
+
 def normalize_date(date_value: Any) -> str:
     """
     Normalize a date value to YYYY-MM-DD string format.
@@ -218,8 +281,9 @@ def normalize_date(date_value: Any) -> str:
             return date_str
 
         # Try to parse common formats
-        for fmt in ['%Y-%m-%dT%H:%M:%S', '%Y-%m-%dT%H:%M:%S.%f', '%Y-%m-%d %H:%M:%S',
-                    '%Y-%m-%dT%H:%M:%SZ', '%Y-%m-%d %H:%M:%S.%f',
+        for fmt in ['%Y-%m-%d', '%Y/%m/%d',
+                    '%Y-%m-%dT%H:%M:%SZ', '%Y-%m-%dT%H:%M:%S', '%Y-%m-%dT%H:%M:%S.%f', '%Y-%m-%d %H:%M:%S',
+                    '%Y-%m-%d %H:%M:%S.%f',
                     '%m/%d/%Y', '%d/%m/%Y', '%m-%d-%Y', '%d-%m-%Y']:
             try:
                 dt = datetime.strptime(date_str[:min(len(date_str), 26)], fmt)
@@ -227,12 +291,16 @@ def normalize_date(date_value: Any) -> str:
             except ValueError:
                 continue
 
-        # If it has a 'T' or space, just take the date part
-        if 'T' in date_str:
-            return date_str.split('T')[0]
-        if ' ' in date_str:
-            return date_str.split(' ')[0]
+        # If it is a timestamp, keep just the date part. Only split when the
+        # leading text really is a date -- see _date_part_before.
+        for _sep in ('T', ' '):
+            _head = _date_part_before(date_str, _sep)
+            if _head:
+                return _head
 
+        # Not a date at all. Hand it back untouched: callers such as lookup()
+        # use this to normalise keys before comparing them, and a mangled key
+        # matches the wrong row instead of failing loudly.
         return date_str
 
     # If datetime object
@@ -255,10 +323,10 @@ def normalize_date(date_value: Any) -> str:
 
     # Fallback - convert to string and try to extract date
     str_val = str(date_value).strip()
-    if 'T' in str_val:
-        return str_val.split('T')[0]
-    if ' ' in str_val:
-        return str_val.split(' ')[0]
+    for _sep in ('T', ' '):
+        _head = _date_part_before(str_val, _sep)
+        if _head:
+            return _head
 
     return str_val
 
@@ -798,29 +866,23 @@ def _coerce_for_comparison(a, b):
             return na, nb
     return a, b
 
-def eq(a: Any, b: Any) -> bool:
-    a, b = _coerce_for_comparison(a, b)
-    return a == b
+def eq(a: Any, b: Any) -> Any:
+    return _broadcast_compare(a, b, _cmp(lambda x, y: x == y))
 
-def neq(a: Any, b: Any) -> bool:
-    a, b = _coerce_for_comparison(a, b)
-    return a != b
+def neq(a: Any, b: Any) -> Any:
+    return _broadcast_compare(a, b, _cmp(lambda x, y: x != y))
 
-def gt(a: Any, b: Any) -> bool:
-    a, b = _coerce_for_comparison(a, b)
-    return a > b
+def gt(a: Any, b: Any) -> Any:
+    return _broadcast_compare(a, b, _cmp(lambda x, y: x > y))
 
-def gte(a: Any, b: Any) -> bool:
-    a, b = _coerce_for_comparison(a, b)
-    return a >= b
+def gte(a: Any, b: Any) -> Any:
+    return _broadcast_compare(a, b, _cmp(lambda x, y: x >= y))
 
-def lt(a: Any, b: Any) -> bool:
-    a, b = _coerce_for_comparison(a, b)
-    return a < b
+def lt(a: Any, b: Any) -> Any:
+    return _broadcast_compare(a, b, _cmp(lambda x, y: x < y))
 
-def lte(a: Any, b: Any) -> bool:
-    a, b = _coerce_for_comparison(a, b)
-    return a <= b
+def lte(a: Any, b: Any) -> Any:
+    return _broadcast_compare(a, b, _cmp(lambda x, y: x <= y))
 
 def between(x: Any, l: Any, u: Any) -> bool:
     x = _unwrap_row_aware(x)
@@ -864,6 +926,16 @@ def any_op(lst: List[bool]) -> bool:
     return any(lst)
 
 def if_op(cond: bool, t: Any, f: Any) -> Any:
+    if isinstance(cond, (list, tuple)):
+        # A comparison against an array yields a per-element mask. Picking a
+        # single branch from it would quietly take the same branch every time
+        # (a non-empty list is always truthy), so say what to do instead.
+        raise ValueError(
+            'if(): the condition is an array of ' + str(len(cond)) + ' values, '
+            'not a single true/false. Comparisons against an array return one '
+            'result PER ELEMENT. Either reduce it -- if(any(mask), ...) or '
+            'if(all(mask), ...) -- or map the whole decision over the array '
+            'with apply_each(items, "if(eq(each, x), a, b)").')
     return t if cond else f
 
 def coalesce(*args) -> Any:
@@ -882,6 +954,183 @@ def switch(value: Any, cases: Dict[Any, Any], default_val: Any = None) -> Any:
         return default_val
 
 # Date Functions
+
+def _as_date_or_none(v):
+    """
+    Return v's canonical YYYY-MM-DD form, or None when v is not a date.
+
+    Numbers and booleans are never dates. Everything else is offered to
+    normalize_date, and only accepted when the result actually has a date
+    shape -- normalize_date hands back unrecognised text unchanged.
+    """
+    if v is None or isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        # Upstream treats every number as "not a date", but THIS repo keeps
+        # normalize_date's numeric YYYYMMDD branch (upstream deleted it) and
+        # the events really do carry postingDate as NumberInt(20260131).
+        # Honour that range here so eq('2026-01-31', 20260131) keeps matching
+        # exactly as it did before broadcasting was introduced.
+        try:
+            n = int(v)
+        except Exception:
+            return None
+        if not (19000101 <= n <= 29991231):
+            return None
+        try:
+            nd = normalize_date(n)
+        except Exception:
+            return None
+        return nd if nd and _DATE_HEAD_RE.match(nd) else None
+    try:
+        n = normalize_date(v)
+    except Exception:
+        return None
+    return n if n and _DATE_HEAD_RE.match(n) else None
+
+
+def _comparable_pair(x, y):
+    """
+    Put two values on comparable footing, normalising them when BOTH are dates,
+    so the same instant written two ways still matches (e.g. '2026-02-28' vs
+    '2026-02-28T00:00:00'). lookup() already normalised its keys this way; the
+    comparison family did not.
+    """
+    dx, dy = _as_date_or_none(x), _as_date_or_none(y)
+    if dx is not None and dy is not None:
+        return dx, dy
+    # Legacy fallback: the pre-broadcast comparison coerced whenever EITHER
+    # side looked like a date and both normalised to something truthy (see
+    # _coerce_for_comparison). Keeping it means adopting broadcasting changes
+    # nothing for scalars -- e.g. a stray 'ABC' vs 20260131 still yields the
+    # old string comparison instead of a new TypeError.
+    if _is_date_like(x) or _is_date_like(y):
+        try:
+            nx, ny = normalize_date(x), normalize_date(y)
+        except Exception:
+            return x, y
+        if nx and ny:
+            return nx, ny
+    return x, y
+
+
+def _cmp(scalar_op):
+    """Wrap a comparison so date operands are normalised first."""
+    def _apply(x, y):
+        cx, cy = _comparable_pair(x, y)
+        return scalar_op(cx, cy)
+    return _apply
+
+
+def _broadcast_compare(a, b, scalar_op):
+    """
+    Apply a two-argument comparison element-wise when exactly ONE side is an
+    array, so the date comparators below vectorise the way arithmetic already
+    does (multiply(prices, 2) -> a list).
+
+    Two deliberate exceptions:
+      * _RowAwareArray resolves to the CURRENT ROW's scalar, exactly as it
+        does for arithmetic, so schedule column formulas are unaffected.
+      * array-vs-array stays whole-object comparison.
+    Values are NOT coerced to numbers: these compare strings and dates too.
+
+    NOTE: only the date_* helpers below use this. The general comparison
+    family (eq/neq/gt/gte/lt/lte/between) is deliberately left on its
+    existing scalar semantics.
+    """
+    _RAA = globals().get('_RowAwareArray')
+    if _RAA is not None:
+        # Unwrap to the CURRENT ROW's scalar, and fall back to 0 when that row
+        # is None. schedule() pads a short context array with None, so without
+        # the fallback an out-of-range period turns gt/gte/lt/lte into a
+        # TypeError (the column then stores "ERROR: ..." and reads back as 0)
+        # and flips eq(arr, 0) from True to False. _unwrap_row_aware -- the
+        # pre-broadcast path -- did exactly this coercion.
+        if isinstance(a, _RAA):
+            a = a._row if a._row is not None else 0
+        if isinstance(b, _RAA):
+            b = b._row if b._row is not None else 0
+    a_is_list = isinstance(a, (list, tuple))
+    b_is_list = isinstance(b, (list, tuple))
+    if a_is_list and not b_is_list:
+        return [scalar_op(x, b) for x in a]
+    if b_is_list and not a_is_list:
+        return [scalar_op(a, y) for y in b]
+    return scalar_op(a, b)
+
+
+def date_diff_days(d1: Any, d2: Any) -> int:
+    """SIGNED difference in calendar days: (d2 - d1). Positive when d2 is AFTER
+    d1, negative when before, 0 if equal or either date is invalid. Unlike
+    days_between (absolute magnitude), this preserves direction so you can tell
+    which date comes first — use it for calendar-month clipping and the like."""
+    try:
+        n1, n2 = normalize_date(d1), normalize_date(d2)
+        if not n1 or not n2:
+            return 0
+        return (datetime.fromisoformat(n2) - datetime.fromisoformat(n1)).days
+    except Exception:
+        return 0
+
+
+def date_diff_months(d1: Any, d2: Any) -> int:
+    """SIGNED whole-month difference: (d2 - d1) in months. Positive when d2 is
+    after d1. Complements months_between (which is unsigned)."""
+    try:
+        n1, n2 = normalize_date(d1), normalize_date(d2)
+        if not n1 or not n2:
+            return 0
+        a, b = datetime.fromisoformat(n1), datetime.fromisoformat(n2)
+    except Exception:
+        return 0
+    return (b.year - a.year) * 12 + (b.month - a.month)
+
+
+def _date_compare_scalar(d1: Any, d2: Any) -> int:
+    """Reliable calendar comparison: -1 if d1 < d2, 0 if equal, 1 if d1 > d2.
+    Use this instead of gt()/lt() on dates (those compare numerically and
+    mis-order date strings). Returns 0 when either date is invalid."""
+    try:
+        n1, n2 = normalize_date(d1), normalize_date(d2)
+        if not n1 or not n2:
+            return 0
+        a, b = datetime.fromisoformat(n1), datetime.fromisoformat(n2)
+    except Exception:
+        return 0
+    return -1 if a < b else (1 if a > b else 0)
+
+
+def date_compare(d1: Any, d2: Any) -> Any:
+    """-1 / 0 / 1 calendar comparison; vectorises over an array argument."""
+    return _broadcast_compare(d1, d2, _date_compare_scalar)
+
+
+def date_before(d1: Any, d2: Any) -> Any:
+    """True if date d1 is strictly before d2 (reliable calendar comparison).
+
+    Vectorises when exactly one side is an array, like every other comparison.
+    """
+    return _broadcast_compare(d1, d2, lambda x, y: _date_compare_scalar(x, y) < 0)
+
+
+def date_after(d1: Any, d2: Any) -> Any:
+    """True if date d1 is strictly after d2 (reliable calendar comparison)."""
+    return _broadcast_compare(d1, d2, lambda x, y: _date_compare_scalar(x, y) > 0)
+
+
+def _date_equals_scalar(d1: Any, d2: Any) -> bool:
+    try:
+        n1, n2 = normalize_date(d1), normalize_date(d2)
+    except Exception:
+        return False
+    return bool(n1) and bool(n2) and n1 == n2
+
+
+def date_equals(d1: Any, d2: Any) -> Any:
+    """True if d1 and d2 are the same calendar date (after normalisation)."""
+    return _broadcast_compare(d1, d2, _date_equals_scalar)
+
+
 def days_between(d1: Any, d2: Any) -> int:
     """
     Robust days between that accepts strings, datetime objects, or None.
@@ -2898,6 +3147,13 @@ def _get_transaction_results():
 def _clear_transaction_results():
     """Clear the transaction results list"""
     _set_tls("transaction_results", [])
+    _set_tls("skipped_zero_amount", 0)
+
+
+def _get_skipped_zero_amount():
+    """How many zero-amount transactions createTransaction() suppressed this run."""
+    # TLS: skipped_zero_amount
+    return _get_tls("skipped_zero_amount", 0)
 
 # Global variable to hold the current instrumentid (set by server.py during execution)
 # _current_instrumentid handled via TLS (default: "STANDALONE")
@@ -2929,6 +3185,22 @@ def _get_current_postingdate():
     """Get the current postingdate."""
     # TLS: _current_postingdate
     return _get_tls("current_postingdate")
+
+
+# Current sub-instrument id for the row being processed. Set by the generated
+# template alongside _set_current_instrumentid. Stored in thread-local storage
+# like the other per-run state so parallel model execution stays isolated.
+
+def _set_current_subinstrumentid(subinstrumentid):
+    """Set the current sub-instrument id for the row being processed."""
+    # TLS: current_subinstrumentid
+    _set_tls("current_subinstrumentid",
+             str(subinstrumentid) if subinstrumentid not in (None, '') else '1')
+
+def _get_current_subinstrumentid():
+    """Get the current sub-instrument id (defaults to '1')."""
+    # TLS: current_subinstrumentid
+    return _get_tls("current_subinstrumentid", '1')
 
 
 def _in_schedule_eval():
@@ -3120,6 +3392,20 @@ def createTransaction(postingdate: Any, effectivedate: Any, transactiontype: Any
         # Round to 4 decimal places by default
         amt_num = round(amt_num, 4)
 
+        # A zero-amount transaction carries no economic content, so it is not
+        # generated at all. This is the single choke point for emitting a
+        # transaction, so the guard applies to every rule and every path —
+        # preview, dry run and persisted report alike. Previously the zero
+        # transaction WAS built here and only discarded much later (in
+        # manager.py, right before persistence), which meant every zero
+        # result still paid for accounting-period lookups, logging, and a
+        # round trip through the batch pipeline for nothing. The count is
+        # tracked (see _get_skipped_zero_amount) so the drop can be reported
+        # rather than silently changing a run's row count.
+        if amt_num == 0:
+            _set_tls("skipped_zero_amount", _get_tls("skipped_zero_amount", 0) + 1)
+            continue
+
         txn = {
             'postingdate': posting_str,
             'effectivedate': effective_str,
@@ -3128,6 +3414,16 @@ def createTransaction(postingdate: Any, effectivedate: Any, transactiontype: Any
             'transactiontype': str(type_raw) if type_raw is not None else '',
             'amount': amt_num
         }
+
+        if _TRACE_TRANSACTIONS:
+            _dl, _txt = _dsl_call_site()
+            logger.info(
+                "createTransaction: type=%s amount=%s sub=%s posting=%s effective=%s"
+                "%s",
+                txn['transactiontype'], txn['amount'], sub_id,
+                posting_str, effective_str,
+                (f"  <- DSL line {_dl}: {_txt}" if _txt else ""),
+            )
 
         _get_tls("transaction_results", []).append(txn)
         created.append(txn)
@@ -3811,6 +4107,9 @@ DSL_FUNCTIONS = {
     'coalesce': coalesce, 'switch': switch,
 
     # Date
+    'date_diff_days': date_diff_days, 'date_diff_months': date_diff_months,
+    'date_compare': date_compare, 'date_before': date_before,
+    'date_after': date_after, 'date_equals': date_equals,
     'days_between': days_between, 'months_between': months_between, 'years_between': years_between,
     'add_days': add_days, 'add_months': add_months, 'add_years': add_years,
     'subtract_days': subtract_days, 'subtract_months': subtract_months, 'subtract_years': subtract_years,
@@ -3912,7 +4211,13 @@ DSL_FUNCTION_METADATA = [
     {"name": "coalesce", "params": "*args", "description": "Return the first non-empty value from a list — useful for providing a fallback default when a value may be missing.", "category": "Logical"},
     {"name": "switch", "params": "value, cases, default", "description": "Look up a value against a set of named cases and return the matching result, or a default value if no match is found.", "category": "Logical"},
 
-    # Date (19)
+    # Date (25)
+    {"name": "date_diff_days", "params": "d1, d2", "description": "SIGNED days from d1 to d2 (positive if d2 is after d1, negative if before). Use instead of days_between when direction matters.", "category": "Date"},
+    {"name": "date_diff_months", "params": "d1, d2", "description": "SIGNED whole months from d1 to d2 (positive if d2 is after d1). Signed counterpart of months_between.", "category": "Date"},
+    {"name": "date_compare", "params": "d1, d2", "description": "Reliable calendar comparison: -1 if d1<d2, 0 if equal, 1 if d1>d2. Use instead of gt/lt on dates.", "category": "Date"},
+    {"name": "date_before", "params": "d1, d2", "description": "True if date d1 is strictly before d2 (reliable calendar comparison).", "category": "Date"},
+    {"name": "date_after", "params": "d1, d2", "description": "True if date d1 is strictly after d2 (reliable calendar comparison).", "category": "Date"},
+    {"name": "date_equals", "params": "d1, d2", "description": "True if d1 and d2 are the same calendar date.", "category": "Date"},
     {"name": "days_between", "params": "d1, d2", "description": "Calculate the number of calendar days between two dates.", "category": "Date"},
     {"name": "months_between", "params": "d1, d2", "description": "Calculate the number of complete months between two dates.", "category": "Date"},
     {"name": "years_between", "params": "d1, d2", "description": "Calculate the number of complete years between two dates.", "category": "Date"},

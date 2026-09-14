@@ -17,9 +17,144 @@ Usage:
 """
 
 import ast
+import functools
+import logging
 import os
 import re
 from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Missing-field tolerance for the generated collect_* helpers
+# ---------------------------------------------------------------------------
+# The collect_* family is emitted INTO the template by DSL Studio (they appear
+# as "<dsl_template>" frames in tracebacks), so they cannot be changed here.
+# They raise ValueError when a referenced field is absent from every loaded
+# event. That is correct for a genuine typo, but it also hard-fails the
+# legitimate first-period case where a balance event exists with no balance
+# columns yet -- e.g.
+#     REVENUE_BALANCE(EffectiveDate, InstrumentId, PostingDate, SubInstrumentId)
+# The template's functions resolve their own names through exec_globals (that
+# dict IS their module namespace), so rebinding an entry there also intercepts
+# the template's internal calls.
+_COLLECT_FUNCTION_NAMES = (
+    'collect',
+    'collect_all',
+    'collect_by_instrument',
+    'collect_by_subinstrument',
+    'collect_effectivedates_for_subinstrument',
+    'collect_subinstrumentids',
+)
+
+# Matched against the message so ONLY the missing-field case is softened;
+# every other ValueError from the template still propagates.
+_MISSING_FIELD_MARKER = 'no loaded event supplies a field named'
+
+# Default ON. Set FYNTRAC_LENIENT_COLLECT=false to restore hard failures.
+_LENIENT_COLLECT = os.getenv(
+    'FYNTRAC_LENIENT_COLLECT', 'true'
+).strip().lower() not in ('0', 'false', 'no', 'off')
+
+
+def _make_collect_lenient(fn, name: str):
+    """Wrap a generated collect_* helper so a missing field yields no rows
+    instead of aborting the whole instrument.
+
+    Returns an EMPTY _RowAwareArray (dsl_functions' hybrid list/scalar type,
+    the same one schedule() injects for context arrays). It is still an empty
+    sequence -- len() == 0, iterates as empty, falsy -- but it also answers 0
+    in arithmetic, so a template doing a raw `total + prior_balance` on the
+    collected value gets 0 instead of
+    "TypeError: unsupported operand type(s) for +: 'int' and 'NoneType'".
+
+    A plain [] was not enough: array_get([], i) / array_first([]) /
+    array_last([]) default to None, and the generated template performs raw
+    Python arithmetic on the result. Note this only covers the value itself --
+    if the template extracts with array_get(x, i) and NO default, that call
+    still yields None and the fix belongs in the model, not here.
+
+    Every substitution is logged at WARNING with the original message, so a
+    real typo stays visible instead of silently becoming zero.
+    """
+    @functools.wraps(fn)
+    def _lenient(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except ValueError as e:
+            if _MISSING_FIELD_MARKER not in str(e):
+                raise
+            _ref = args[0] if args else kwargs.get('field', '?')
+            logger.warning(
+                "%s(%r): field not present in any loaded event — substituting an "
+                "empty result for this instrument. If this is not the expected "
+                "first-period/no-data case, the reference is wrong. Detail: %s",
+                name, _ref, str(e).split('. Loaded events:')[0],
+            )
+            try:
+                from app.python_model.dsl_functions import _RowAwareArray
+                return _RowAwareArray([], row_value=0)
+            except Exception:
+                return []
+    _lenient.__wrapped_by_fyntrac__ = True
+    return _lenient
+
+
+def _describe_template_failure(python_code: str, exc: Exception, max_names: int = 40):
+    """Pinpoint a failure that happened inside the generated template.
+
+    A traceback frame gives a line NUMBER in "<dsl_template>", but that file
+    exists only in memory, so the log shows no source and no variable names --
+    which makes an error like "int + NoneType" impossible to act on. We still
+    hold the template text in `python_code`, so print the offending line and
+    name the locals that are None in that frame.
+
+    Only variable NAMES are logged (plus types for non-None operands on the
+    line), never values, so no business data reaches the log.
+    """
+    try:
+        frames = []
+        tb = exc.__traceback__
+        while tb:
+            frames.append(tb)
+            tb = tb.tb_next
+        target = None
+        for t in reversed(frames):
+            if t.tb_frame.f_code.co_filename == '<dsl_template>':
+                target = t
+                break
+        if target is None:
+            return None
+        lineno = target.tb_lineno
+        lines = (python_code or '').split('\n')
+        src = lines[lineno - 1].strip() if 1 <= lineno <= len(lines) else '<unavailable>'
+        loc = target.tb_frame.f_locals
+        none_names = sorted(
+            k for k, v in loc.items() if v is None and not k.startswith('__')
+        )
+        # Types of the identifiers that actually appear on the failing line --
+        # narrows it down when several locals are None.
+        on_line = sorted({
+            k for k in loc
+            if not k.startswith('__') and re.search(r'\b%s\b' % re.escape(k), src)
+        })
+        types_on_line = ', '.join(
+            f"{k}={type(loc[k]).__name__}" for k in on_line[:max_names]
+        )
+        return lineno, src, none_names[:max_names], types_on_line
+    except Exception:
+        return None
+
+
+def _apply_collect_leniency(exec_globals: dict) -> None:
+    """Rebind the template's collect_* helpers in place (no-op if disabled)."""
+    if not _LENIENT_COLLECT:
+        return
+    for _name in _COLLECT_FUNCTION_NAMES:
+        _fn = exec_globals.get(_name)
+        if callable(_fn) and not getattr(_fn, '__wrapped_by_fyntrac__', False):
+            exec_globals[_name] = _make_collect_lenient(_fn, _name)
 
 try:
     from app.python_model.data_transformer import transform
@@ -161,6 +296,32 @@ class ModelRunner:
         for name in dir(builtins):
             if name not in blocked:
                 safe[name] = getattr(builtins, name)
+
+        # `sum` must follow DSL semantics, not Python's.
+        #
+        # The DSL defines sum as sum_vals, which routes every element through
+        # to_number() and so treats None / '' / 'None' as 0. That binding is
+        # already used in the DSL_FUNCTIONS registry and in schedule()'s column
+        # eval context ("sum": sum_vals). Generated template code, however,
+        # calls a bare sum(...) at Python level, which resolved to the builtin
+        # and raised on any None element:
+        #     sum(balance_row_count) ->
+        #     TypeError: unsupported operand type(s) for +: 'int' and 'NoneType'
+        # even though the same expression evaluates fine inside a schedule
+        # column. Bind it here so the template sees one consistent `sum`.
+        try:
+            from app.python_model.dsl_functions import sum_vals as _sum_vals, to_number as _to_number
+
+            def _dsl_sum(iterable, start=0):
+                """DSL sum: None/blank elements count as 0 (mirrors sum_vals)."""
+                return _to_number(start) + _sum_vals(iterable)
+
+            _dsl_sum.__name__ = 'sum'
+            safe['sum'] = _dsl_sum
+        except Exception:
+            # dsl_functions unavailable -> leave the builtin in place.
+            pass
+
         real_import = getattr(builtins, '__import__')
 
         def _guarded_import(name, _globals=None, _locals=None, fromlist=(), level=0):
@@ -286,6 +447,14 @@ class ModelRunner:
                 '__builtins__': self._build_safe_builtins(),
             }
             exec(compile(python_code, '<dsl_template>', 'exec'), exec_globals)
+            # Soften missing-field failures in the template's collect_* helpers.
+            _apply_collect_leniency(exec_globals)
+            # Keep the POST-PROCESSED source. _inject_missing_field_extractions
+            # inserts lines, so "<dsl_template>" line numbers in a traceback
+            # refer to THIS text, not to the original artifact the caller holds.
+            # Resolving a traceback against the original yields the wrong line
+            # (often a blank one) and mis-numbered # DSL_LINE markers.
+            exec_globals['__fyntrac_source__'] = python_code
             return exec_globals
         except Exception as e:
             dsl_line = self._extract_dsl_line(python_code, e)
@@ -358,6 +527,15 @@ class ModelRunner:
                 transactions = exec_globals['process_standalone'](
                     override_postingdate, override_effectivedate
                 )
+                # process_standalone returns (transactions, print_outputs)
+                # whereas process_event_data returns just the transactions.
+                # Treating the tuple as a list of transactions meant EVERY
+                # standalone model (one with no events) came back with zero
+                # transactions — both entries failed conversion below and were
+                # dropped silently. Mirrors the fix in
+                # backend/server.py::execute_python_template.
+                if isinstance(transactions, tuple):
+                    transactions = transactions[0] if transactions else []
             else:
                 return {
                     "transactions": [],
@@ -387,18 +565,55 @@ class ModelRunner:
                 except Exception:
                     pass
 
+            # createTransaction() now suppresses zero-amount transactions at
+            # the source rather than generating them and relying on the
+            # caller to discard them before persistence. Report the count so
+            # a batch whose row count is lower than its input can explain
+            # the gap instead of it looking like missing data.
+            zero_skipped = 0
+            try:
+                try:
+                    from app.python_model.dsl_functions import (
+                        _get_skipped_zero_amount,
+                    )
+                except Exception:
+                    from dsl_functions import _get_skipped_zero_amount
+                zero_skipped = _get_skipped_zero_amount()
+            except Exception:
+                zero_skipped = 0
+
             return {
                 "transactions": normalized,
                 "print_outputs": print_outputs,
+                "zero_amount_skipped": zero_skipped,
                 "error": None,
                 "instrument_count": len(event_data),
             }
 
         except Exception as e:
-            dsl_line = self._extract_dsl_line(python_code, e)
+            # Resolve line numbers against the source that was actually
+            # compiled (see __fyntrac_source__), falling back to the caller's
+            # copy when compilation never got that far.
+            _src = (exec_globals or {}).get('__fyntrac_source__') or python_code
+            dsl_line = self._extract_dsl_line(_src, e)
             error_msg = str(e)
             if dsl_line:
                 error_msg = f"[DSL Line {dsl_line}] {error_msg}"
+            # The returned dict carries only str(e), which for a bare
+            # KeyError/NameError inside a generated template is often a single
+            # opaque token (e.g. "collect") with no indication of where it came
+            # from. Log the real traceback so the failing line is recoverable.
+            logger.error(
+                "Model execution failed (%s): %s", type(e).__name__, error_msg,
+                exc_info=True,
+            )
+            _info = _describe_template_failure(_src, e)
+            if _info:
+                _ln, _src, _nones, _types = _info
+                logger.error("  template line %d: %s", _ln, _src)
+                logger.error("  operands on that line: %s", _types or '(none resolved)')
+                logger.error("  locals that are None here: %s",
+                             ', '.join(_nones) if _nones else '(none)')
             return {
                 "transactions": [],
                 "print_outputs": [],
